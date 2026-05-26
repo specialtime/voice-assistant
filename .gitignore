@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.venv/
+.opencode-voz/
+.opencode-voz/memory/
+.opencode-voz/tmp/
