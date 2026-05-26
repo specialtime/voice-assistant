@@ -1,1 +1,1 @@
-"""Servicios para integración con Azure y OpenCode."""
+"""Services for Azure and OpenCode integrations."""

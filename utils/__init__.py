@@ -1,1 +1,1 @@
-"""Utilidades del asistente de voz."""
+"""Utilities for the voice assistant."""

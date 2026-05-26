@@ -97,7 +97,7 @@ class VoiceAssistantApp:
         try:
             import keyboard  # type: ignore
         except ModuleNotFoundError as exc:  # pragma: no cover
-            raise RuntimeError("keyboard es obligatorio para registrar el atajo global") from exc
+            raise RuntimeError("keyboard is required to register the global hotkey") from exc
 
         keyboard.add_hotkey(HOTKEY, self.handle_toggle)
         print(f"[assistant] Listo. Usa {HOTKEY} para iniciar/detener la grabación")

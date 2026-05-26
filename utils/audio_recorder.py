@@ -39,7 +39,7 @@ class AudioRecorder:
         try:
             import pyaudio  # type: ignore
         except ModuleNotFoundError as exc:  # pragma: no cover
-            raise RuntimeError("pyaudio no está instalado") from exc
+            raise RuntimeError("pyaudio is not installed") from exc
 
         self._frames = []
         self._stop_event.clear()
@@ -58,7 +58,7 @@ class AudioRecorder:
 
     def stop_recording(self) -> Path:
         if not self.is_recording:
-            raise RuntimeError("No hay una grabación activa")
+            raise RuntimeError("No active recording is in progress")
 
         self._stop_event.set()
         if self._thread:

@@ -34,12 +34,12 @@ class AzureSpeechService:
 
     def transcribe_wav(self, wav_file: Path) -> str:
         if not self.speech_key or not self.speech_region:
-            raise RuntimeError("Configura AZURE_SPEECH_KEY y AZURE_SPEECH_REGION")
+            raise RuntimeError("Set AZURE_SPEECH_KEY and AZURE_SPEECH_REGION")
 
         try:
             import azure.cognitiveservices.speech as speechsdk  # type: ignore
         except ModuleNotFoundError as exc:  # pragma: no cover
-            raise RuntimeError("azure-cognitiveservices-speech no está instalado") from exc
+            raise RuntimeError("azure-cognitiveservices-speech is not installed") from exc
 
         speech_config = speechsdk.SpeechConfig(subscription=self.speech_key, region=self.speech_region)
         audio_config = speechsdk.audio.AudioConfig(filename=str(wav_file))
@@ -64,12 +64,12 @@ class AzureSpeechService:
 
     def speak_ssml(self, ssml: str) -> None:
         if not self.speech_key or not self.speech_region:
-            raise RuntimeError("Configura AZURE_SPEECH_KEY y AZURE_SPEECH_REGION")
+            raise RuntimeError("Set AZURE_SPEECH_KEY and AZURE_SPEECH_REGION")
 
         try:
             import azure.cognitiveservices.speech as speechsdk  # type: ignore
         except ModuleNotFoundError as exc:  # pragma: no cover
-            raise RuntimeError("azure-cognitiveservices-speech no está instalado") from exc
+            raise RuntimeError("azure-cognitiveservices-speech is not installed") from exc
 
         speech_config = speechsdk.SpeechConfig(subscription=self.speech_key, region=self.speech_region)
         speech_config.speech_synthesis_voice_name = self.voice_name
@@ -78,4 +78,4 @@ class AzureSpeechService:
 
         if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
             details = speechsdk.CancellationDetails.from_result(result)
-            raise RuntimeError(f"Error de síntesis de voz: {details.reason}")
+            raise RuntimeError(f"Speech synthesis failed: {details.reason}")

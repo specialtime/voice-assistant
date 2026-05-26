@@ -48,7 +48,7 @@ class OpenCodeClient:
             if isinstance(candidate, str) and candidate.strip():
                 return self._to_ssml(candidate.strip())
 
-        raise RuntimeError("OpenCode devolvió una respuesta vacía")
+        raise RuntimeError("OpenCode returned an empty response")
 
     def send_prompt(self, prompt: str) -> str:
         payload = {
