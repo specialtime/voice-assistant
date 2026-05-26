@@ -4,7 +4,7 @@ import argparse
 import json
 import os
 import signal
-import time
+import threading
 from pathlib import Path
 
 from services.azure_service import AzureSpeechService
@@ -15,10 +15,13 @@ from utils.session_manager import SessionManager
 ASSISTANT_DIR_NAME = ".opencode-voz"
 DEFAULT_PORT = 4096
 HOTKEY = "ctrl+alt+v"
+AGENT_NAME = "asistente_voz"
 
 ASSISTANT_PROMPT = """# Asistente de voz
 Siempre responde en SSML válido para Azure Speech.
 Si necesitas ejecutar comandos, explica la acción de forma breve y natural.
+Usa una estructura <speak><voice>...</voice></speak> válida.
+Puedes usar <break time="200ms"/> para pausas cortas y <prosody rate="0%"> para mantener naturalidad.
 """
 
 
@@ -43,7 +46,7 @@ def ensure_isolated_environment(base_dir: Path) -> dict[str, Path]:
         }
         config_path.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    agent_prompt_path = agents_dir / "asistente_voz.md"
+    agent_prompt_path = agents_dir / f"{AGENT_NAME}.md"
     if not agent_prompt_path.exists():
         agent_prompt_path.write_text(ASSISTANT_PROMPT, encoding="utf-8")
 
@@ -69,7 +72,11 @@ class VoiceAssistantApp:
 
         endpoint = os.getenv("OPENCODE_ENDPOINT", "http://127.0.0.1:4096/chat")
         self.opencode_client = OpenCodeClient(endpoint=endpoint, session_manager=self.session_manager)
+        self.opencode_client.agent_name = AGENT_NAME
+        self.opencode_client.ssml_lang = os.getenv("OPENCODE_SSML_LANG", "es-ES")
+        self.opencode_client.ssml_voice_name = self.azure_service.voice_name
         self.running = True
+        self.shutdown_event = threading.Event()
 
     def handle_toggle(self) -> None:
         if not self.audio_recorder.is_recording:
@@ -91,7 +98,11 @@ class VoiceAssistantApp:
     def _shutdown(self, *_: object) -> None:
         self.running = False
         if self.audio_recorder.is_recording:
-            self.audio_recorder.stop_recording()
+            try:
+                self.audio_recorder.stop_recording()
+            except RuntimeError:
+                pass
+        self.shutdown_event.set()
 
     def run(self) -> None:
         try:
@@ -106,7 +117,7 @@ class VoiceAssistantApp:
         signal.signal(signal.SIGTERM, self._shutdown)
 
         while self.running:
-            time.sleep(0.1)
+            self.shutdown_event.wait(timeout=0.5)
 
 
 def parse_args() -> argparse.Namespace:

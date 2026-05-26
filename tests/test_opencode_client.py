@@ -5,6 +5,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import requests
+
 from services.opencode_client import OpenCodeClient
 from utils.session_manager import SessionManager
 
@@ -44,6 +46,39 @@ class OpenCodeClientTests(unittest.TestCase):
 
         self.assertIn("<speak", response)
         self.assertIn("abre calculadora", response)
+
+    @patch("services.opencode_client.requests.post")
+    def test_network_errors_raise_descriptive_exception(self, mock_post: MagicMock) -> None:
+        client = self._client()
+        mock_post.side_effect = requests.RequestException("boom")
+
+        with self.assertRaisesRegex(RuntimeError, "Failed to contact OpenCode"):
+            client.send_prompt("hola")
+
+    @patch("services.opencode_client.requests.post")
+    def test_malformed_ssml_is_escaped_and_wrapped(self, mock_post: MagicMock) -> None:
+        client = self._client()
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"ssml": "<speak><voice>bad"}
+        mock_response.raise_for_status.return_value = None
+        mock_post.return_value = mock_response
+
+        response = client.send_prompt("hola")
+
+        self.assertIn("&lt;speak&gt;&lt;voice&gt;bad", response)
+
+    @patch("services.opencode_client.requests.post")
+    def test_preescaped_entities_are_not_double_escaped(self, mock_post: MagicMock) -> None:
+        client = self._client()
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"response": "&lt;ok&gt;"}
+        mock_response.raise_for_status.return_value = None
+        mock_post.return_value = mock_response
+
+        response = client.send_prompt("hola")
+
+        self.assertIn("&lt;ok&gt;", response)
+        self.assertNotIn("&amp;lt;ok&amp;gt;", response)
 
 
 if __name__ == "__main__":

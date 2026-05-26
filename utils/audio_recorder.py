@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import tempfile
 import threading
+import uuid
 import wave
 from pathlib import Path
 
 
 class AudioRecorder:
+    STOP_THREAD_TIMEOUT_SECONDS = 3
+
     def __init__(
         self,
         sample_rate: int = 16000,
@@ -62,7 +65,9 @@ class AudioRecorder:
 
         self._stop_event.set()
         if self._thread:
-            self._thread.join(timeout=3)
+            self._thread.join(timeout=self.STOP_THREAD_TIMEOUT_SECONDS)
+            if self._thread.is_alive():
+                raise RuntimeError("Audio recording thread did not stop in time")
 
         self._stream.stop_stream()
         self._stream.close()
@@ -71,7 +76,7 @@ class AudioRecorder:
         self._pyaudio.terminate()
 
         self.is_recording = False
-        output_file = self.temp_dir / "voice_input.wav"
+        output_file = self.temp_dir / f"voice_input_{uuid.uuid4().hex}.wav"
         with wave.open(str(output_file), "wb") as wav_file:
             wav_file.setnchannels(self.channels)
             wav_file.setsampwidth(sample_size)

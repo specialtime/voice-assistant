@@ -23,7 +23,11 @@ class SessionManager:
         if not self.session_file.exists():
             return
 
-        data = json.loads(self.session_file.read_text(encoding="utf-8"))
+        try:
+            data = json.loads(self.session_file.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            self.reset_session()
+            return
         self.thread_id = data.get("thread_id")
 
     def set_thread_id(self, thread_id: str | None) -> None:

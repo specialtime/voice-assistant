@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from html import unescape
+from xml.etree import ElementTree
+from xml.sax.saxutils import escape
 
 import requests
 
@@ -12,21 +15,23 @@ class OpenCodeClient:
     endpoint: str
     session_manager: SessionManager
     timeout: int = 30
+    agent_name: str = "asistente_voz"
+    ssml_lang: str = "es-ES"
+    ssml_voice_name: str = "es-ES-ElviraNeural"
 
     def _to_ssml(self, text: str) -> str:
         if text.lstrip().startswith("<speak"):
-            return text
+            try:
+                root = ElementTree.fromstring(text)
+                if root.tag.endswith("speak"):
+                    return text
+            except ElementTree.ParseError:
+                pass
 
-        escaped = (
-            text.replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace('"', "&quot;")
-            .replace("'", "&apos;")
-        )
+        escaped = escape(unescape(text), {'"': "&quot;", "'": "&apos;"})
         return (
-            '<speak version="1.0" xml:lang="es-ES">'
-            f"<voice name=\"es-ES-ElviraNeural\">{escaped}</voice>"
+            f'<speak version="1.0" xml:lang="{self.ssml_lang}">'
+            f"<voice name=\"{self.ssml_voice_name}\">{escaped}</voice>"
             "</speak>"
         )
 
@@ -52,14 +57,17 @@ class OpenCodeClient:
 
     def send_prompt(self, prompt: str) -> str:
         payload = {
-            "agent": "asistente_voz",
+            "agent": self.agent_name,
             "input": prompt,
             "thread_id": self.session_manager.get_thread_id(),
         }
 
-        response = requests.post(self.endpoint, json=payload, timeout=self.timeout)
-        response.raise_for_status()
-        data = response.json()
+        try:
+            response = requests.post(self.endpoint, json=payload, timeout=self.timeout)
+            response.raise_for_status()
+            data = response.json()
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Failed to contact OpenCode at {self.endpoint}") from exc
 
         new_thread_id = data.get("thread_id") or data.get("id")
         if isinstance(new_thread_id, str) and new_thread_id:
