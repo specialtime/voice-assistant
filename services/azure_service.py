@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import ModuleType
 
 
 DEFAULT_FILLER_WORDS = {"eh", "em", "mmm", "mm", "uh", "um", "hmm"}
@@ -20,7 +21,7 @@ class AzureSpeechService:
         self.speech_key = speech_key
         self.speech_region = speech_region
         self.voice_name = voice_name
-        self.voice_style = voice_style.strip() if voice_style else None
+        self.voice_style = voice_style.strip() if voice_style and voice_style.strip() else None
         self.min_confidence = min_confidence
         self.filler_words = filler_words or DEFAULT_FILLER_WORDS
 
@@ -74,7 +75,7 @@ class AzureSpeechService:
 
         return text
 
-    def _apply_voice_style(self, speech_config: object, speechsdk: object) -> None:
+    def _apply_voice_style(self, speech_config: "speechsdk.SpeechConfig", speechsdk: ModuleType) -> None:
         if not self.voice_style:
             return
 

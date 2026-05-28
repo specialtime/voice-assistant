@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import re
+from html.parser import HTMLParser
 from xml.etree import ElementTree
 
 import requests
 
 from utils.session_manager import SessionManager
+
+
+class _TagStripper(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
 
 
 @dataclass
@@ -18,7 +27,10 @@ class OpenCodeClient:
 
     @staticmethod
     def _strip_tags(text: str) -> str:
-        return re.sub(r"<[^>]+>", "", text).strip()
+        parser = _TagStripper()
+        parser.feed(text)
+        parser.close()
+        return "".join(parser.parts).strip()
 
     def _strip_ssml(self, text: str) -> str:
         if not text.lstrip().startswith("<speak"):
