@@ -70,7 +70,7 @@ class VoiceAssistantApp:
             voice_name=os.getenv("AZURE_TTS_VOICE", "es-ES-ElviraNeural"),
         )
 
-        endpoint = os.getenv("OPENCODE_ENDPOINT", "http://127.0.0.1:4096/chat")
+        endpoint = os.getenv("OPENCODE_ENDPOINT", "http://127.0.0.1:4096")
         self.opencode_client = OpenCodeClient(endpoint=endpoint, session_manager=self.session_manager)
         self.opencode_client.agent_name = AGENT_NAME
         self.opencode_client.ssml_lang = os.getenv("OPENCODE_SSML_LANG", "es-ES")

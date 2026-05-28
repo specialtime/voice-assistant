@@ -22,7 +22,7 @@ pip install -r requirements.txt
 export AZURE_SPEECH_KEY="tu_clave"
 export AZURE_SPEECH_REGION="tu_region"
 export AZURE_TTS_VOICE="es-ES-ElviraNeural" # opcional
-export OPENCODE_ENDPOINT="http://127.0.0.1:4096/chat" # opcional
+export OPENCODE_ENDPOINT="http://127.0.0.1:4096" # opcional
 ```
 
 ## Ejecución
