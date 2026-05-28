@@ -19,12 +19,12 @@ class OpenCodeClientTests(unittest.TestCase):
         return OpenCodeClient(endpoint="http://127.0.0.1:4096/chat", session_manager=manager)
 
     @patch("services.opencode_client.requests.post")
-    def test_send_prompt_updates_thread_and_returns_ssml(self, mock_post: MagicMock) -> None:
+    def test_send_prompt_updates_thread_and_returns_text(self, mock_post: MagicMock) -> None:
         client = self._client()
         mock_response = MagicMock()
         mock_response.json.return_value = {
             "thread_id": "thread-abc",
-            "ssml": '<speak version="1.0" xml:lang="es-ES"><voice name="es-ES-ElviraNeural">ok</voice></speak>',
+            "response": "ok",
         }
         mock_response.raise_for_status.return_value = None
         mock_post.return_value = mock_response
@@ -32,10 +32,10 @@ class OpenCodeClientTests(unittest.TestCase):
         response = client.send_prompt("hola")
 
         self.assertEqual("thread-abc", client.session_manager.get_thread_id())
-        self.assertTrue(response.startswith("<speak"))
+        self.assertEqual("ok", response)
 
     @patch("services.opencode_client.requests.post")
-    def test_plain_text_response_is_wrapped_as_ssml(self, mock_post: MagicMock) -> None:
+    def test_plain_text_response_is_returned(self, mock_post: MagicMock) -> None:
         client = self._client()
         mock_response = MagicMock()
         mock_response.json.return_value = {"response": "abre calculadora"}
@@ -44,8 +44,7 @@ class OpenCodeClientTests(unittest.TestCase):
 
         response = client.send_prompt("hola")
 
-        self.assertIn("<speak", response)
-        self.assertIn("abre calculadora", response)
+        self.assertEqual("abre calculadora", response)
 
     @patch("services.opencode_client.requests.post")
     def test_network_errors_raise_descriptive_exception(self, mock_post: MagicMock) -> None:
@@ -56,7 +55,21 @@ class OpenCodeClientTests(unittest.TestCase):
             client.send_prompt("hola")
 
     @patch("services.opencode_client.requests.post")
-    def test_malformed_ssml_is_escaped_and_wrapped(self, mock_post: MagicMock) -> None:
+    def test_ssml_response_is_stripped_to_text(self, mock_post: MagicMock) -> None:
+        client = self._client()
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "ssml": '<speak version="1.0"><voice name="es-ES-ElviraNeural">hola mundo</voice></speak>'
+        }
+        mock_response.raise_for_status.return_value = None
+        mock_post.return_value = mock_response
+
+        response = client.send_prompt("hola")
+
+        self.assertEqual("hola mundo", response)
+
+    @patch("services.opencode_client.requests.post")
+    def test_malformed_ssml_is_cleaned_when_possible(self, mock_post: MagicMock) -> None:
         client = self._client()
         mock_response = MagicMock()
         mock_response.json.return_value = {"ssml": "<speak><voice>bad"}
@@ -65,20 +78,7 @@ class OpenCodeClientTests(unittest.TestCase):
 
         response = client.send_prompt("hola")
 
-        self.assertIn("&lt;speak&gt;&lt;voice&gt;bad", response)
-
-    @patch("services.opencode_client.requests.post")
-    def test_preescaped_entities_are_not_double_escaped(self, mock_post: MagicMock) -> None:
-        client = self._client()
-        mock_response = MagicMock()
-        mock_response.json.return_value = {"response": "&lt;ok&gt;"}
-        mock_response.raise_for_status.return_value = None
-        mock_post.return_value = mock_response
-
-        response = client.send_prompt("hola")
-
-        self.assertIn("&lt;ok&gt;", response)
-        self.assertNotIn("&amp;lt;ok&amp;gt;", response)
+        self.assertEqual("bad", response)
 
 
 if __name__ == "__main__":

@@ -18,10 +18,9 @@ HOTKEY = "ctrl+alt+v"
 AGENT_NAME = "asistente_voz"
 
 ASSISTANT_PROMPT = """# Asistente de voz
-Siempre responde en SSML válido para Azure Speech.
+Responde con texto claro y natural para la síntesis de voz.
 Si necesitas ejecutar comandos, explica la acción de forma breve y natural.
-Usa una estructura <speak><voice>...</voice></speak> válida.
-Puedes usar <break time="200ms"/> para pausas cortas y <prosody rate="0%"> para mantener naturalidad.
+No utilices SSML ni etiquetas XML.
 """
 
 
@@ -68,13 +67,12 @@ class VoiceAssistantApp:
             speech_key=os.getenv("AZURE_SPEECH_KEY", ""),
             speech_region=os.getenv("AZURE_SPEECH_REGION", ""),
             voice_name=os.getenv("AZURE_TTS_VOICE", "es-ES-ElviraNeural"),
+            voice_style=os.getenv("AZURE_TTS_STYLE"),
         )
 
         endpoint = os.getenv("OPENCODE_ENDPOINT", "http://127.0.0.1:4096/chat")
         self.opencode_client = OpenCodeClient(endpoint=endpoint, session_manager=self.session_manager)
         self.opencode_client.agent_name = AGENT_NAME
-        self.opencode_client.ssml_lang = os.getenv("OPENCODE_SSML_LANG", "es-ES")
-        self.opencode_client.ssml_voice_name = self.azure_service.voice_name
         self.running = True
         self.shutdown_event = threading.Event()
 
@@ -92,8 +90,8 @@ class VoiceAssistantApp:
             return
 
         print(f"[assistant] Usuario: {user_text}")
-        ssml = self.opencode_client.send_prompt(user_text)
-        self.azure_service.speak_ssml(ssml)
+        response_text = self.opencode_client.send_prompt(user_text)
+        self.azure_service.speak_text(response_text)
 
     def _shutdown(self, *_: object) -> None:
         self.running = False
