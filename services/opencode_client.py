@@ -26,10 +26,14 @@ class OpenCodeClient:
         if not parsed.scheme:
             return raw
         path = parsed.path or ""
-        for suffix in ("/chat", "/session"):
-            if path.endswith(suffix):
-                path = path[: -len(suffix)]
-                break
+        stripped = True
+        while stripped:
+            stripped = False
+            for suffix in ("/chat", "/session"):
+                if path.endswith(suffix):
+                    path = path[: -len(suffix)].rstrip("/")
+                    stripped = True
+                    break
         return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
 
     def _session_url(self) -> str:
