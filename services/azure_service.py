@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import ModuleType
 
 
 DEFAULT_FILLER_WORDS = {"eh", "em", "mmm", "mm", "uh", "um", "hmm"}
@@ -13,12 +14,15 @@ class AzureSpeechService:
         speech_key: str,
         speech_region: str,
         voice_name: str,
+        voice_style: str | None = None,
         min_confidence: float = 0.55,
         filler_words: set[str] | None = None,
     ) -> None:
         self.speech_key = speech_key
         self.speech_region = speech_region
         self.voice_name = voice_name
+        stripped_style = voice_style.strip() if voice_style else ""
+        self.voice_style = stripped_style or None
         self.min_confidence = min_confidence
         self.filler_words = filler_words or DEFAULT_FILLER_WORDS
 
@@ -72,7 +76,18 @@ class AzureSpeechService:
 
         return text
 
-    def speak_ssml(self, ssml: str) -> None:
+    def _apply_voice_style(self, speech_config: "speechsdk.SpeechConfig", speechsdk: ModuleType) -> None:
+        if not self.voice_style:
+            return
+
+        try:
+            property_id = speechsdk.PropertyId.SpeechServiceConnection_SynthStyle  # type: ignore[attr-defined]
+        except AttributeError:
+            return
+
+        speech_config.set_property(property_id, self.voice_style)
+
+    def speak_text(self, text: str) -> None:
         if not self.speech_key or not self.speech_region:
             raise RuntimeError("Set AZURE_SPEECH_KEY and AZURE_SPEECH_REGION")
 
@@ -83,8 +98,9 @@ class AzureSpeechService:
 
         speech_config = speechsdk.SpeechConfig(subscription=self.speech_key, region=self.speech_region)
         speech_config.speech_synthesis_voice_name = self.voice_name
+        self._apply_voice_style(speech_config, speechsdk)
         synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config)
-        result = synthesizer.speak_ssml_async(ssml).get()
+        result = synthesizer.speak_text_async(text).get()
 
         if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
             details = speechsdk.CancellationDetails.from_result(result)

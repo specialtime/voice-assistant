@@ -22,7 +22,12 @@ pip install -r requirements.txt
 export AZURE_SPEECH_KEY="tu_clave"
 export AZURE_SPEECH_REGION="tu_region"
 export AZURE_TTS_VOICE="es-ES-ElviraNeural" # opcional
+<<<<<<< HEAD
 export OPENCODE_ENDPOINT="http://127.0.0.1:4096" # opcional
+=======
+export AZURE_TTS_STYLE="friendly" # opcional, depende de la voz
+export OPENCODE_ENDPOINT="http://127.0.0.1:4096/chat" # opcional
+>>>>>>> origin/main
 ```
 
 ## Ejecución
@@ -38,7 +43,7 @@ Atajo global: `Ctrl+Alt+V` (toggle iniciar/detener grabación).
 En el primer arranque se crean:
 
 - `.opencode-voz/config.json` (plugin `opencode-mem` habilitado en puerto 4096)
-- `.opencode-voz/agents/asistente_voz.md` (prompt del agente orientado a SSML)
+- `.opencode-voz/agents/asistente_voz.md` (prompt del agente para respuestas en texto plano)
 - `.opencode-voz/memory/` (memoria vectorial persistente)
 - `.opencode-voz/session.json` (thread_id efímero; se limpia al inicio/fin)
 
