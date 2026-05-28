@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from html import unescape
+from html.parser import HTMLParser
 from xml.etree import ElementTree
-from xml.sax.saxutils import escape
 
 import requests
 
 from utils.session_manager import SessionManager
+
+
+class _TagStripper(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
 
 
 @dataclass
@@ -16,29 +24,33 @@ class OpenCodeClient:
     session_manager: SessionManager
     timeout: int = 30
     agent_name: str = "asistente_voz"
-    ssml_lang: str = "es-ES"
-    ssml_voice_name: str = "es-ES-ElviraNeural"
 
-    def _to_ssml(self, text: str) -> str:
-        if text.lstrip().startswith("<speak"):
-            try:
-                root = ElementTree.fromstring(text)
-                if root.tag.endswith("speak"):
-                    return text
-            except ElementTree.ParseError:
-                pass
+    @staticmethod
+    def _strip_tags(text: str) -> str:
+        parser = _TagStripper()
+        try:
+            parser.feed(text)
+            parser.close()
+        except Exception:
+            return text.strip()
+        return "".join(parser.parts).strip()
 
-        escaped = escape(unescape(text), {'"': "&quot;", "'": "&apos;"})
-        return (
-            f'<speak version="1.0" xml:lang="{self.ssml_lang}">'
-            f"<voice name=\"{self.ssml_voice_name}\">{escaped}</voice>"
-            "</speak>"
-        )
+    def _strip_ssml(self, text: str) -> str:
+        if not text.lstrip().startswith("<speak"):
+            return text
+
+        try:
+            root = ElementTree.fromstring(text)
+        except ElementTree.ParseError:
+            return self._strip_tags(text)
+
+        if root.tag.endswith("speak"):
+            return "".join(root.itertext()).strip()
+
+        return text
 
     def _extract_response(self, data: dict) -> str:
         candidates = [
-            data.get("ssml"),
-            data.get("response_ssml"),
             data.get("response"),
             data.get("message"),
         ]
@@ -46,12 +58,13 @@ class OpenCodeClient:
         choices = data.get("choices")
         if isinstance(choices, list) and choices:
             message = choices[0].get("message", {})
-            candidates.append(message.get("ssml"))
             candidates.append(message.get("content"))
 
         for candidate in candidates:
             if isinstance(candidate, str) and candidate.strip():
-                return self._to_ssml(candidate.strip())
+                cleaned = self._strip_ssml(candidate.strip())
+                if cleaned != "":
+                    return cleaned
 
         raise RuntimeError("OpenCode returned an empty response")
 
