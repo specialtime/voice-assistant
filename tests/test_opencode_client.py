@@ -59,7 +59,7 @@ class OpenCodeClientTests(unittest.TestCase):
         client = self._client()
         mock_response = MagicMock()
         mock_response.json.return_value = {
-            "ssml": '<speak version="1.0"><voice name="es-ES-ElviraNeural">hola mundo</voice></speak>'
+            "response": '<speak version="1.0"><voice name="es-ES-ElviraNeural">hola mundo</voice></speak>'
         }
         mock_response.raise_for_status.return_value = None
         mock_post.return_value = mock_response
@@ -72,7 +72,7 @@ class OpenCodeClientTests(unittest.TestCase):
     def test_malformed_ssml_is_cleaned_when_possible(self, mock_post: MagicMock) -> None:
         client = self._client()
         mock_response = MagicMock()
-        mock_response.json.return_value = {"ssml": "<speak><voice>bad"}
+        mock_response.json.return_value = {"response": "<speak><voice>bad"}
         mock_response.raise_for_status.return_value = None
         mock_post.return_value = mock_response
 

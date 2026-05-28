@@ -18,8 +18,7 @@ class OpenCodeClient:
 
     @staticmethod
     def _strip_tags(text: str) -> str:
-        stripped = re.sub(r"<[^>]+>", "", text).strip()
-        return stripped or text
+        return re.sub(r"<[^>]+>", "", text).strip()
 
     def _strip_ssml(self, text: str) -> str:
         if not text.lstrip().startswith("<speak"):
@@ -31,8 +30,7 @@ class OpenCodeClient:
             return self._strip_tags(text)
 
         if root.tag.endswith("speak"):
-            stripped = "".join(root.itertext()).strip()
-            return stripped or self._strip_tags(text)
+            return "".join(root.itertext()).strip()
 
         return text
 
@@ -47,11 +45,11 @@ class OpenCodeClient:
             message = choices[0].get("message", {})
             candidates.append(message.get("content"))
 
-        candidates.extend([data.get("ssml"), data.get("response_ssml")])
-
         for candidate in candidates:
             if isinstance(candidate, str) and candidate.strip():
-                return self._strip_ssml(candidate.strip())
+                cleaned = self._strip_ssml(candidate.strip())
+                if cleaned:
+                    return cleaned
 
         raise RuntimeError("OpenCode returned an empty response")
 

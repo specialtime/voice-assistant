@@ -20,7 +20,7 @@ class AzureSpeechService:
         self.speech_key = speech_key
         self.speech_region = speech_region
         self.voice_name = voice_name
-        self.voice_style = (voice_style or "").strip() or None
+        self.voice_style = voice_style.strip() if voice_style else None
         self.min_confidence = min_confidence
         self.filler_words = filler_words or DEFAULT_FILLER_WORDS
 
@@ -81,9 +81,9 @@ class AzureSpeechService:
         try:
             property_id = speechsdk.PropertyId.SpeechServiceConnection_SynthStyle  # type: ignore[attr-defined]
         except AttributeError:
-            property_id = "SpeechServiceConnection_SynthStyle"
+            return
 
-        speech_config.set_property(property_id, self.voice_style)  # type: ignore[call-arg]
+        speech_config.set_property(property_id, self.voice_style)
 
     def speak_text(self, text: str) -> None:
         if not self.speech_key or not self.speech_region:
