@@ -28,8 +28,11 @@ class OpenCodeClient:
     @staticmethod
     def _strip_tags(text: str) -> str:
         parser = _TagStripper()
-        parser.feed(text)
-        parser.close()
+        try:
+            parser.feed(text)
+            parser.close()
+        except Exception:
+            return text.strip()
         return "".join(parser.parts).strip()
 
     def _strip_ssml(self, text: str) -> str:
@@ -60,7 +63,7 @@ class OpenCodeClient:
         for candidate in candidates:
             if isinstance(candidate, str) and candidate.strip():
                 cleaned = self._strip_ssml(candidate.strip())
-                if cleaned:
+                if cleaned != "":
                     return cleaned
 
         raise RuntimeError("OpenCode returned an empty response")

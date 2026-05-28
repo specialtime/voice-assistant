@@ -21,7 +21,8 @@ class AzureSpeechService:
         self.speech_key = speech_key
         self.speech_region = speech_region
         self.voice_name = voice_name
-        self.voice_style = voice_style.strip() if voice_style and voice_style.strip() else None
+        stripped_style = voice_style.strip() if voice_style else ""
+        self.voice_style = stripped_style or None
         self.min_confidence = min_confidence
         self.filler_words = filler_words or DEFAULT_FILLER_WORDS
 
