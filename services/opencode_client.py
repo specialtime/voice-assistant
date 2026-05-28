@@ -21,16 +21,17 @@ class OpenCodeClient:
 
     def _resolve_endpoint(self) -> str:
         endpoint = self.endpoint.rstrip("/")
+        agent_prefix = f"/agents/{self.agent_name}"
 
-        if "/agents/" in endpoint:
-            if endpoint.endswith("/chat"):
-                return endpoint
+        if endpoint.endswith(f"{agent_prefix}/chat"):
+            return endpoint
+        if endpoint.endswith(agent_prefix):
             return f"{endpoint}/chat"
 
         if endpoint.endswith("/chat"):
             endpoint = endpoint[: -len("/chat")]
 
-        return f"{endpoint}/agents/{self.agent_name}/chat"
+        return f"{endpoint}{agent_prefix}/chat"
 
     def _to_ssml(self, text: str) -> str:
         if text.lstrip().startswith("<speak"):
