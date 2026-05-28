@@ -19,6 +19,19 @@ class OpenCodeClient:
     ssml_lang: str = "es-ES"
     ssml_voice_name: str = "es-ES-ElviraNeural"
 
+    def _resolve_endpoint(self) -> str:
+        endpoint = self.endpoint.rstrip("/")
+
+        if "/agents/" in endpoint:
+            if endpoint.endswith("/chat"):
+                return endpoint
+            return f"{endpoint}/chat"
+
+        if endpoint.endswith("/chat"):
+            endpoint = endpoint[: -len("/chat")]
+
+        return f"{endpoint}/agents/{self.agent_name}/chat"
+
     def _to_ssml(self, text: str) -> str:
         if text.lstrip().startswith("<speak"):
             try:
@@ -57,17 +70,17 @@ class OpenCodeClient:
 
     def send_prompt(self, prompt: str) -> str:
         payload = {
-            "agent": self.agent_name,
             "input": prompt,
             "thread_id": self.session_manager.get_thread_id(),
         }
+        endpoint = self._resolve_endpoint()
 
         try:
-            response = requests.post(self.endpoint, json=payload, timeout=self.timeout)
+            response = requests.post(endpoint, json=payload, timeout=self.timeout)
             response.raise_for_status()
             data = response.json()
         except requests.RequestException as exc:
-            raise RuntimeError(f"Failed to contact OpenCode at {self.endpoint}") from exc
+            raise RuntimeError(f"Failed to contact OpenCode at {endpoint}") from exc
 
         new_thread_id = data.get("thread_id") or data.get("id")
         if isinstance(new_thread_id, str) and new_thread_id:

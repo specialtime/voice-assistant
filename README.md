@@ -5,8 +5,10 @@ Asistente de voz para Windows con Azure Speech y OpenCode, ejecutado en un entor
 ## Requisitos
 
 - Python 3.10+
-- OpenCode ejecutándose localmente (`opencode serve --config-dir .opencode-voz`)
+- OpenCode ejecutándose localmente (`opencode serve`)
 - Azure Speech (clave y región)
+
+El asistente envía las peticiones al endpoint del agente `asistente_voz`.
 
 ## Instalación
 
@@ -22,7 +24,7 @@ pip install -r requirements.txt
 export AZURE_SPEECH_KEY="tu_clave"
 export AZURE_SPEECH_REGION="tu_region"
 export AZURE_TTS_VOICE="es-ES-ElviraNeural" # opcional
-export OPENCODE_ENDPOINT="http://127.0.0.1:4096/chat" # opcional
+export OPENCODE_ENDPOINT="http://127.0.0.1:4096" # opcional (se usa /agents/asistente_voz/chat)
 ```
 
 ## Ejecución

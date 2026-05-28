@@ -31,6 +31,11 @@ class OpenCodeClientTests(unittest.TestCase):
 
         response = client.send_prompt("hola")
 
+        mock_post.assert_called_once_with(
+            "http://127.0.0.1:4096/agents/asistente_voz/chat",
+            json={"input": "hola", "thread_id": None},
+            timeout=client.timeout,
+        )
         self.assertEqual("thread-abc", client.session_manager.get_thread_id())
         self.assertTrue(response.startswith("<speak"))
 
