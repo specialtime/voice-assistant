@@ -1,12 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-<<<<<<< HEAD
-from html import unescape
-from urllib.parse import urlsplit, urlunsplit
-=======
 from html.parser import HTMLParser
->>>>>>> origin/main
+from urllib.parse import urlsplit, urlunsplit
 from xml.etree import ElementTree
 
 import requests
@@ -30,7 +26,6 @@ class OpenCodeClient:
     timeout: int = 30
     agent_name: str = "asistente_voz"
 
-<<<<<<< HEAD
     def _base_url(self) -> str:
         raw = self.endpoint.rstrip("/")
         parsed = urlsplit(raw)
@@ -57,15 +52,6 @@ class OpenCodeClient:
         except requests.RequestException as exc:
             raise RuntimeError(f"Failed to contact OpenCode at {url}") from exc
 
-    def _to_ssml(self, text: str) -> str:
-        if text.lstrip().startswith("<speak"):
-            try:
-                root = ElementTree.fromstring(text)
-                if root.tag.endswith("speak"):
-                    return text
-            except ElementTree.ParseError:
-                pass
-=======
     @staticmethod
     def _strip_tags(text: str) -> str:
         parser = _TagStripper()
@@ -75,7 +61,6 @@ class OpenCodeClient:
         except Exception:
             return text.strip()
         return "".join(parser.parts).strip()
->>>>>>> origin/main
 
     def _strip_ssml(self, text: str) -> str:
         if not text.lstrip().startswith("<speak"):
@@ -105,44 +90,48 @@ class OpenCodeClient:
                 return content.strip()
         return None
 
+    def _clean_candidate(self, candidate: object) -> str | None:
+        if isinstance(candidate, str) and candidate.strip():
+            cleaned = self._strip_ssml(candidate.strip())
+            if cleaned != "":
+                return cleaned
+        return None
+
     def _extract_response(self, data: dict) -> str:
         parts_text = self._extract_parts_text(data.get("parts"))
-        if parts_text:
-            return self._to_ssml(parts_text)
+        cleaned = self._clean_candidate(parts_text)
+        if cleaned:
+            return cleaned
 
         message = data.get("message")
         if isinstance(message, dict):
             parts_text = self._extract_parts_text(message.get("parts"))
-            if parts_text:
-                return self._to_ssml(parts_text)
-            for key in ("ssml", "response_ssml", "response", "content", "text"):
-                candidate = message.get(key)
-                if isinstance(candidate, str) and candidate.strip():
-                    return self._to_ssml(candidate.strip())
+            cleaned = self._clean_candidate(parts_text)
+            if cleaned:
+                return cleaned
+            for key in ("response", "content", "text", "ssml", "response_ssml"):
+                cleaned = self._clean_candidate(message.get(key))
+                if cleaned:
+                    return cleaned
 
-        candidates = [
-            data.get("response"),
-            data.get("message"),
-        ]
+        cleaned = self._clean_candidate(data.get("response"))
+        if cleaned:
+            return cleaned
+
+        cleaned = self._clean_candidate(message)
+        if cleaned:
+            return cleaned
 
         choices = data.get("choices")
         if isinstance(choices, list) and choices:
             message = choices[0].get("message", {})
-<<<<<<< HEAD
             if isinstance(message, dict):
                 parts_text = self._extract_parts_text(message.get("parts"))
-                if parts_text:
-                    return self._to_ssml(parts_text)
-                candidates.append(message.get("ssml"))
-                candidates.append(message.get("content"))
-=======
-            candidates.append(message.get("content"))
->>>>>>> origin/main
-
-        for candidate in candidates:
-            if isinstance(candidate, str) and candidate.strip():
-                cleaned = self._strip_ssml(candidate.strip())
-                if cleaned != "":
+                cleaned = self._clean_candidate(parts_text)
+                if cleaned:
+                    return cleaned
+                cleaned = self._clean_candidate(message.get("content"))
+                if cleaned:
                     return cleaned
 
         raise RuntimeError("OpenCode returned an empty response")
