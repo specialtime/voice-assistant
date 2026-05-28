@@ -26,14 +26,10 @@ class OpenCodeClient:
         if not parsed.scheme:
             return raw
         path = parsed.path or ""
-        stripped = True
-        while stripped:
-            stripped = False
-            for suffix in ("/chat", "/session"):
-                if path.endswith(suffix):
-                    path = path[: -len(suffix)].rstrip("/")
-                    stripped = True
-                    break
+        for suffix in ("/session/chat", "/chat", "/session"):
+            if path.endswith(suffix):
+                path = path[: -len(suffix)].rstrip("/")
+                break
         return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
 
     def _session_url(self) -> str:
@@ -66,15 +62,18 @@ class OpenCodeClient:
             "</speak>"
         )
 
-    def _extract_parts_text(self, parts: object) -> str | None:
+    def _extract_parts_text(self, parts: list[dict[str, object]] | None) -> str | None:
         if not isinstance(parts, list):
             return None
         for part in parts:
             if not isinstance(part, dict):
                 continue
-            text = part.get("text") or part.get("content")
+            text = part.get("text")
             if isinstance(text, str) and text.strip():
                 return text.strip()
+            content = part.get("content")
+            if isinstance(content, str) and content.strip():
+                return content.strip()
         return None
 
     def _extract_response(self, data: dict) -> str:
@@ -120,7 +119,9 @@ class OpenCodeClient:
         if not thread_id:
             session_payload = {"agent": self.agent_name}
             session_data = self._post_json(self._session_url(), session_payload)
-            thread_id = session_data.get("id") or session_data.get("thread_id")
+            thread_id = session_data.get("id")
+            if not isinstance(thread_id, str) or not thread_id:
+                thread_id = session_data.get("thread_id")
             if isinstance(thread_id, str) and thread_id:
                 self.session_manager.set_thread_id(thread_id)
             else:
