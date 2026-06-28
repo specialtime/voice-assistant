@@ -25,7 +25,7 @@ if %errorlevel% neq 0 (
 
 :: 1. Lanzar opencode serve en background (hidden, puerto 57215, .cortex-dev\)
 echo [INFO] Iniciando opencode serve DEV (puerto 57215, .cortex-dev\)...
-start "" pythonw.exe start_opencode_hidden.py
+start "" pythonw.exe scripts\start_opencode_hidden.py
 
 :: 2. Esperar 5 segundos a que opencode arranque
 timeout /t 5 /nobreak >nul

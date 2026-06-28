@@ -21,7 +21,7 @@ if %errorlevel% neq 0 (
 
 :: 1. Lanzar opencode serve en background (sin ventana, con auto-restart)
 echo [INFO] Iniciando opencode serve (hidden)...
-start "" pythonw.exe start_opencode_hidden.py
+start "" pythonw.exe scripts\start_opencode_hidden.py
 
 :: 2. Esperar 5 segundos a que opencode arranque
 timeout /t 5 /nobreak >nul
