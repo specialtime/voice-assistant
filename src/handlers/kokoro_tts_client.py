@@ -60,13 +60,13 @@ class KokoroTTSClient:
 
         if not model_path.exists():
             raise RuntimeError(
-                f"Modelo Kokoro no encontrado en {model_path}. "
+                f"Modelo Kokoro no encontrado: {model_path.name}. "
                 f"Descargar kokoro-v1.0.onnx desde "
                 f"https://github.com/thewh1teagle/kokoro-onnx/releases/tag/model-files-v1.0"
             )
         if not voices_path.exists():
             raise RuntimeError(
-                f"Voces Kokoro no encontradas en {voices_path}. "
+                f"Voces Kokoro no encontradas: {voices_path.name}. "
                 f"Descargar voices-v1.0.bin desde "
                 f"https://github.com/thewh1teagle/kokoro-onnx/releases/tag/model-files-v1.0"
             )
