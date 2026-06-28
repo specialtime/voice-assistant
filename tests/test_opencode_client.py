@@ -854,3 +854,219 @@ class TestOpenCodeClient:
             f"prompt_async_idx={prompt_async_idx}. El stream DEBE abrirse "
             f"ANTES que prompt_async para cerrar la race window."
         )
+
+    # ──────────────────────────────────────────────────────────────────
+    # Regression: httpx.StreamConsumed (bug fix/stream-consumed-sse)
+    # ──────────────────────────────────────────────────────────────────
+    @patch("handlers.opencode_client.httpx.Client")
+    def test_send_command_stream_iter_lines_called_once(
+        self, mock_client_cls, mock_settings
+    ):
+        """Regression: ``send_command_stream`` debe invocar ``iter_lines()`` UNA SOLA VEZ.
+
+        Bug original: el handler llamaba ``stream_response.iter_lines()`` dos veces
+        sobre el mismo ``httpx.Response``:
+
+        - Primera llamada: dentro de ``while not connected_seen`` para consumir
+          el evento ``server.connected`` y confirmar la suscripción.
+        - Segunda llamada: dentro de ``for line_bytes in stream_response.iter_lines()``
+          para procesar el resto de deltas y ``session.idle``.
+
+        ``httpx.Response.iter_raw()`` setea ``is_stream_consumed = True`` antes
+        de la primera iteración, por lo que la segunda llamada a ``iter_lines()``
+        (que pasa por ``iter_text()`` → ``iter_bytes()`` → ``iter_raw()``) levanta
+        ``httpx.StreamConsumed`` y aborta el stream con cero deltas emitidos.
+
+        Este test monta un mock que reproduce fielmente ese comportamiento de
+        httpx: la segunda invocación de ``iter_lines()`` levanta
+        ``StreamConsumed``. Con el código viejo, el test falla. Con el fix
+        (un único ``for line_bytes in iter_lines()``), el test pasa.
+        """
+        mock_client = mock_client_cls.return_value
+        mock_client.post.side_effect = [
+            _ok_response({"id": "ses_reg"}),  # ensure_session
+            self._ok_post(204),               # prompt_async
+        ]
+
+        # Stream SSE con un server.connected + 2 deltas + session.idle
+        sse_lines = [
+            b'data: {"id":"c","type":"server.connected","properties":{}}',
+            b'',
+            b'data: {"id":"d1","type":"session.next.text.delta",'
+            b'"properties":{"sessionID":"ses_reg","delta":"Hola"}}',
+            b'',
+            b'data: {"id":"d2","type":"session.next.text.delta",'
+            b'"properties":{"sessionID":"ses_reg","delta":" mundo"}}',
+            b'',
+            b'data: {"id":"d3","type":"session.idle",'
+            b'"properties":{"sessionID":"ses_reg"}}',
+            b'',
+        ]
+
+        # Mock que reproduce el comportamiento de httpx real:
+        # iter_lines() devuelve un iter NUEVO cada vez, pero la segunda
+        # invocación levanta StreamConsumed (porque iter_raw agotó el stream).
+        iter_for_lines = iter(sse_lines)
+
+        def iter_lines_side_effect():
+            """Primera llamada OK, segunda llamada → StreamConsumed."""
+            iter_lines_side_effect.call_count += 1
+            if iter_lines_side_effect.call_count == 1:
+                return iter(iter_for_lines)
+            # Segunda invocación: simula lo que hace httpx real
+            raise httpx.StreamConsumed()
+
+        iter_lines_side_effect.call_count = 0
+
+        def iter_lines_stream_consumed():
+            """Segunda invocación → StreamConsumed (httpx 0.27.x)."""
+            raise httpx.StreamConsumed()
+
+        iter_lines_side_effect.consumed = iter_lines_stream_consumed
+
+        mock_stream = MagicMock(name="StreamResponse")
+        mock_stream.__enter__.return_value = mock_stream
+        mock_stream.__exit__.return_value = False
+        mock_stream.raise_for_status = MagicMock()
+        mock_stream.iter_lines.side_effect = iter_lines_side_effect
+        mock_client.stream.return_value = mock_stream
+
+        client = OpenCodeClient(mock_settings, "fake_pass", _BASE_URL)
+
+        # Antes del fix: esto lanzaba httpx.StreamConsumed al re-iterar.
+        # Después del fix: un solo iter_lines() consume todo el stream → OK.
+        deltas = list(client.send_command_stream("hola"))
+
+        assert deltas == ["Hola", " mundo"], (
+            f"Esperaba ['Hola', ' mundo'], obtuve {deltas}. "
+            "Si el test falla con StreamConsumed, alguien revirtió el fix "
+            "que unifica los dos iter_lines() en uno solo."
+        )
+        # Verificar explícitamente que iter_lines() se invoca UNA SOLA VEZ
+        assert iter_lines_side_effect.call_count == 1, (
+            f"iter_lines() fue invocado {iter_lines_side_effect.call_count} "
+            "veces — debe ser exactamente 1 (bug StreamConsumed si es >1)."
+        )
+
+    @patch("handlers.opencode_client.httpx.Client")
+    def test_send_command_stream_raises_if_closed_before_any_event(
+        self, mock_client_cls, mock_settings
+    ):
+        """Edge case: stream se cierra sin emitir ningún evento (ni server.connected).
+
+        Antes del fix unificado, el ``while not connected_seen`` con ``next(..., None)``
+        ya lanzaba ``RuntimeError("Stream SSE cerrado prematuramente")`` al primer
+        ``None`` retornado por ``iter_lines``. Después del fix unificado, ese caso
+        se detecta como ``iter_lines()`` agotado sin haber visto ningún evento
+        completo: el código debe seguir lanzando el mismo ``RuntimeError`` y,
+        crucialmente, NO debe haber enviado ``prompt_async``.
+
+        Regresión objetivo: si alguien revierte el comportamiento o mueve la guarda
+        al lugar equivocado, este test detecta que ``prompt_async`` se envía antes
+        de confirmar la suscripción (reabre la race window).
+        """
+        mock_client = mock_client_cls.return_value
+        # ensure_session crea la sesión; prompt_async NO debe invocarse.
+        mock_client.post.side_effect = [
+            _ok_response({"id": "ses_premature"}),  # ensure_session
+        ]
+
+        # Stream SSE que se cierra sin emitir NADA (ni server.connected).
+        sse_lines: list[bytes] = []
+
+        mock_client.stream.return_value = self._make_sse_stream(sse_lines)
+
+        client = OpenCodeClient(mock_settings, "fake_pass", _BASE_URL)
+
+        with pytest.raises(RuntimeError, match="cerrado prematuramente"):
+            list(client.send_command_stream("hola"))
+
+        # Verificar el invariante crítico: NO se envió prompt_async.
+        # Si el handler enviara prompt_async antes de confirmar la suscripción,
+        # reabriría la race window (commit 9790971) y este test fallaría.
+        assert mock_client.post.call_count == 1, (
+            f"Solo debe haber 1 POST (ensure_session); se hicieron "
+            f"{mock_client.post.call_count}. prompt_async NO debe enviarse si "
+            "el stream se cerró antes de server.connected."
+        )
+
+    @patch("handlers.opencode_client.httpx.Client")
+    def test_send_command_stream_respects_absolute_timeout(
+        self, mock_client_cls, mock_settings
+    ):
+        """Edge case: timeout absoluto del stream corta el loop con WARNING.
+
+        El fix unificado mantiene el chequeo ``time.monotonic() - start_time >
+        streaming_timeout`` dentro del único ``for line_bytes in iter_lines()``.
+        Si el stream está produciendo líneas pero el agente no termina, el handler
+        debe cortar limpio cuando se excede el timeout, loguear WARNING con la
+        cantidad de deltas emitidos y retornar sin propagar excepción (el caller
+        puede hacer fallback síncrono).
+
+        Mockeamos ``time.monotonic`` para forzar el timeout inmediatamente,
+        agregando un evento ``server.connected`` válido antes de que el delta
+        hipotético dispare la guarda. ``prompt_async`` SÍ debe enviarse (porque
+        el primer evento completo sí se vio), pero el loop debe cortarse antes
+        de procesar más deltas.
+        """
+        # Forzar timeout corto vía settings
+        mock_settings["opencode"]["streaming_timeout_seconds"] = 1
+
+        mock_client = mock_client_cls.return_value
+        mock_client.post.side_effect = [
+            _ok_response({"id": "ses_to"}),  # ensure_session
+            self._ok_post(204),              # prompt_async
+        ]
+
+        # Stream con server.connected + 1 delta + 1 session.idle.
+        # El timeout se fuerza vía mock de time.monotonic, así que el handler
+        # debería cortar DESPUÉS del server.connected (que ya envió prompt_async)
+        # y ANTES de procesar el delta.
+        sse_lines = [
+            b'data: {"id":"c","type":"server.connected","properties":{}}',
+            b'',
+            b'data: {"id":"d1","type":"session.next.text.delta",'
+            b'"properties":{"sessionID":"ses_to","delta":"nunca"}}',
+            b'',
+            b'data: {"id":"d2","type":"session.idle",'
+            b'"properties":{"sessionID":"ses_to"}}',
+            b'',
+        ]
+        mock_client.stream.return_value = self._make_sse_stream(sse_lines)
+
+        # Forzar que la PRIMERA llamada a monotonic devuelva un valor que ya
+        # excede el timeout (start_time=0, check=0+1e9 > 1 → corta inmediato).
+        # Pero el handler guarda start_time DENTRO de la función, así que el
+        # truco es que monotonic devuelva un número creciente que rápidamente
+        # supere el timeout. Lo más simple: que cada llamada devuelva un valor
+        # que crece linealmente con un step enorme.
+        monotonic_values = iter([0.0, 0.0, 0.0, 1e9, 1e9, 1e9, 1e9, 1e9])
+
+        def fake_monotonic():
+            return next(monotonic_values, 1e9)
+
+        client = OpenCodeClient(mock_settings, "fake_pass", _BASE_URL)
+
+        with patch(
+            "handlers.opencode_client.time.monotonic", side_effect=fake_monotonic
+        ):
+            # No debe lanzar excepción: el corte por timeout es un cierre limpio.
+            deltas = list(client.send_command_stream("hola"))
+
+        # El delta nunca se yield-ó porque el timeout cortó antes de procesarlo.
+        assert deltas == [], (
+            f"Esperaba [] (timeout cortó antes del delta), obtuve {deltas}"
+        )
+
+        # prompt_async SÍ se envió (porque el primer evento completo, server.connected,
+        # sí se vio antes del check de timeout).
+        prompt_async_calls = []
+        for c in mock_client.post.call_args_list:
+            # `c` es un unittest.mock.call; sus args posicionales están en c.args
+            args = getattr(c, "args", ())
+            if args and isinstance(args[0], str) and args[0].endswith("/prompt_async"):
+                prompt_async_calls.append(c)
+        assert len(prompt_async_calls) == 1, (
+            f"prompt_async debió invocarse 1 vez tras server.connected; "
+            f"se invocó {len(prompt_async_calls)} veces."
+        )
