@@ -136,6 +136,7 @@ Ya soportado por el código actual. El `partID` está en `properties.partID` o `
 2. **UAT streaming** en `tests/test_uat_streaming_pipeline.py`:
    - Escenario: stream con parts de reasoning y text → el TTS solo recibe los deltas de text.
    - Preservar tests existentes (no romper los casos de `message.part.delta` ya cubiertos).
+   - **Criterio de aceptación del usuario**: la UAT debe usar el `comando.wav` del entorno dev (mismo que usan los tests E2E existentes) y verificar que se reproduzca audio con **bytes > 0** (no audio vacío). El test debe fallar si el PCM resultante está vacío o si se filtraron TODOS los deltas (lo que indicaría over-filtering).
 
 ## Referencias
 
