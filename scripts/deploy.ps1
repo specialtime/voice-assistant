@@ -1,4 +1,4 @@
-# deploy.ps1 — Deploya dev → prod (copia solo código + scripts, sin configs/logs/docs).
+# deploy.ps1 -- Deploya dev -> prod (copia solo codigo + scripts, sin configs/logs/docs).
 # Uso: powershell -ExecutionPolicy Bypass -File deploy.ps1
 # Requiere: $env:CORTEX_PROD_DIR apuntando al dir de prod (default: C:\Users\crist\voice-assistant)
 
@@ -7,7 +7,7 @@ $ErrorActionPreference = "Stop"
 $DEV_DIR = Split-Path -Parent $PSScriptRoot
 $PROD_DIR = if ($env:CORTEX_PROD_DIR) { $env:CORTEX_PROD_DIR } else { "C:\Users\crist\voice-assistant" }
 
-Write-Host "[INFO] Deploy dev → prod"
+Write-Host "[INFO] Deploy dev -> prod"
 Write-Host "[INFO] Dev:  $DEV_DIR"
 Write-Host "[INFO] Prod: $PROD_DIR"
 
@@ -25,7 +25,7 @@ if (-not (Test-Path -LiteralPath "$DEV_DIR\src")) {
 
 # Archivos/dirs a copiar (relativos a DEV_DIR)
 # NOTA: NO se copia config\settings.json porque dev y prod tienen configs distintas
-#       (dev: logging.level=DEBUG, prod: logging.level=INFO). Si el código necesita
+#       (dev: logging.level=DEBUG, prod: logging.level=INFO). Si el codigo necesita
 #       un nuevo campo de config, agregarlo manualmente a prod.
 # NOTA: NO se copia .env.example ni .gitignore (prod no los necesita).
 $toCopy = @(
@@ -42,9 +42,9 @@ foreach ($item in $toCopy) {
         continue
     }
     if (Test-Path -LiteralPath $src -PathType Container) {
-        # Es un directorio (src\) — eliminar destino si existe, luego copiar
+        # Es un directorio (src\) -- eliminar destino si existe, luego copiar
         # FIX (2026-06-22): Copy-Item anida el dir dentro del destino si este ya existe
-        # (crea src\src\ en vez de sobreescribir src\). Solución: eliminar destino primero.
+        # (crea src\src\ en vez de sobreescribir src\). Solucion: eliminar destino primero.
         if (Test-Path -LiteralPath $dst) {
             Remove-Item -LiteralPath $dst -Recurse -Force
         }
@@ -66,7 +66,7 @@ if (-not (Test-Path -LiteralPath $venvPython)) {
     Write-Host "[INFO] Creando venv en prod (Python 3.10)..."
     & py -3.10 -m venv "$PROD_DIR\.venv"
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "[ERROR] No se pudo crear el venv. Verificá que Python 3.10 esté instalado: py -0p"
+        Write-Host "[ERROR] No se pudo crear el venv. Verifica que Python 3.10 este instalado: py -0p"
         exit 1
     }
     Write-Host "[OK] venv creado en $PROD_DIR\.venv"
@@ -77,7 +77,7 @@ Write-Host "[INFO] Instalando dependencias en venv de prod..."
 & $venvPython -m pip install --upgrade pip 2>&1 | Out-Null
 & $venvPython -m pip install -r "$PROD_DIR\requirements.txt" 2>&1 | ForEach-Object { Write-Host "  $_" }
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "[ERROR] Falló la instalación de dependencias. Revisá requirements.txt."
+    Write-Host "[ERROR] Fallo la instalacion de dependencias. Revisa requirements.txt."
     exit 1
 }
 Write-Host "[OK] Dependencias instaladas en venv de prod"
@@ -88,8 +88,8 @@ Get-ChildItem -Path $PROD_DIR -Recurse -Directory -Filter "__pycache__" -ErrorAc
 
 Write-Host ""
 Write-Host "[OK] Deploy completado."
-Write-Host "[INFO] venv y dependencias actualizados automáticamente en $PROD_DIR\.venv"
-Write-Host "[INFO] NO se copió config\settings.json — si el código necesita un nuevo campo,"
+Write-Host "[INFO] venv y dependencias actualizados automaticamente en $PROD_DIR\.venv"
+Write-Host "[INFO] NO se copio config\settings.json -- si el codigo necesita un nuevo campo,"
 Write-Host "       agregalo manualmente a $PROD_DIR\config\settings.json"
-Write-Host "[INFO] NO se copiaron modelos locales (Whisper/Piper/Kokoro) — están en .gitignore."
-Write-Host "       Si prod no los tiene, descargá los de Kokoro manualmente (ver README)."
+Write-Host "[INFO] NO se copiaron modelos locales (Whisper/Piper/Kokoro) -- estan en .gitignore."
+Write-Host "       Si prod no los tiene, descarga los de Kokoro manualmente (ver README)."
