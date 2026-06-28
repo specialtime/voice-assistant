@@ -240,15 +240,11 @@ class VoiceAssistant:
                         delta_stream = self._opencode.send_command_stream(text)
                         prompt_async_sent = True  # prompt_async fue aceptado (204)
 
-                        # 3+4. Transición a SPEAKING antes del primer audio
-                        with self._lock:
-                            if self._pipeline_generation != generation:
-                                return
-                            self._state = self.STATE_SPEAKING
-                            self._overlay.set_state("speaking")
-                            logger.info("→ SPEAKING (gen=%d, streaming)", generation)
+                        # 3. Cancelación temprana (sin transición de estado)
+                        if self._pipeline_generation != generation:
+                            return
 
-                        # 5. Pipeline streaming: deltas → oraciones → Kokoro → playback
+                        # 4. Pipeline streaming: deltas → oraciones → Kokoro → playback
                         sentence_buffer = SentenceBuffer()
 
                         def sentence_iterator():
@@ -265,7 +261,21 @@ class VoiceAssistant:
                                 yield _strip_markdown(sentence)
 
                         pcm_stream = self._local_tts.synthesize_sentence_stream(sentence_iterator())
-                        self._audio.play_audio_stream(pcm_stream)
+
+                        def pcm_stream_with_speaking_transition():
+                            speaking_set: bool = False
+                            for chunk in pcm_stream:
+                                if not speaking_set and chunk:
+                                    speaking_set = True
+                                    with self._lock:
+                                        if self._pipeline_generation != generation:
+                                            return
+                                        self._state = self.STATE_SPEAKING
+                                        self._overlay.set_state("speaking")
+                                        logger.info("→ SPEAKING (gen=%d, primer PCM real)", generation)
+                                yield chunk
+
+                        self._audio.play_audio_stream(pcm_stream_with_speaking_transition())
                         logger.debug("Streaming pipeline completado (gen=%d)", generation)
 
                 except Exception as e:
