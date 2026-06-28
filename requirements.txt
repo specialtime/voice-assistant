@@ -7,3 +7,5 @@ python-dotenv==1.0.1
 faster-whisper==1.2.1
 piper-tts==1.4.2
 onnxruntime==1.27.0
+kokoro-onnx==0.5.0
+misaki==0.2.0
