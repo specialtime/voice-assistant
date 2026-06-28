@@ -14,6 +14,7 @@ import logging
 import sys
 import threading
 import time
+import types
 from pathlib import Path
 from unittest.mock import MagicMock, PropertyMock, patch
 
@@ -23,6 +24,22 @@ import pytest
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
+
+
+# ──────────────────────────────────────────────────────────────────
+# Stub de kokoro_onnx — registrado a nivel de módulo para que el
+# import top-level de ``main`` (``from kokoro_onnx import Kokoro``)
+# resuelva sin necesidad de tener la dependencia instalada.
+#
+# Mismo patrón que ``tests/test_kokoro_tts_client.py`` y
+# ``tests/test_local_integration.py``. Si este módulo se importa antes
+# que cualquiera de los otros dos, el stub ya estará disponible y no se
+# duplica (es idempotente).
+# ──────────────────────────────────────────────────────────────────
+if "kokoro_onnx" not in sys.modules:
+    _kokoro_stub = types.ModuleType("kokoro_onnx")
+    _kokoro_stub.Kokoro = MagicMock(name="Kokoro")
+    sys.modules["kokoro_onnx"] = _kokoro_stub
 
 
 @pytest.mark.unit
@@ -84,6 +101,19 @@ class TestVoiceAssistantStateMachine:
             # Sobrescribir settings con mock_settings para que los tests no
             # dependan del config/settings.json real.
             assistant._settings = mock_settings
+            # Forzar flujo SÍNCRONO por default en esta suite: los tests que
+            # NO son de streaming (la mayoría) verifican el camino síncrono
+            # ``send_command + synthesize + play_audio``. El default en
+            # config/settings.json es ``streaming_enabled=True``, pero
+            # ``mock_settings`` no incluye esa key en la sección ``opencode``,
+            # por lo que el orquestador cae al default True del
+            # ``.get("streaming_enabled", True)``. Esto rompe los tests que
+            # mockean el flujo síncrono (eran 6 antes de la suite T6-T9).
+            #
+            # Los 4 tests de streaming (T6-T9: ``test_pipeline_streaming_*``)
+            # sobreescriben este atributo explícitamente a ``True`` o ``False``
+            # según su contrato, así que este default no los afecta.
+            assistant._streaming_enabled = False
 
             yield assistant
 
@@ -558,3 +588,184 @@ class TestVoiceAssistantStateMachine:
         patched_assistant._audio.play_audio.assert_not_called()
         patched_assistant._audio.play_audio_stream.assert_not_called()
         assert patched_assistant._state == patched_assistant.STATE_IDLE
+
+    # ──────────────────────────────────────────────────────────────────
+    # Micro-Spec Streaming TTS: pipeline streaming + fallback (T9)
+    # ──────────────────────────────────────────────────────────────────
+    #
+    # Cubre los caminos del nuevo flujo streaming introducido en
+    # `feature/streaming-tts-kokoro`:
+    #   - Flujo streaming exitoso (send_command_stream + synthesize_sentence_stream)
+    #   - Fallback a síncrono si send_command_stream falla
+    #   - streaming_enabled=False → usa el flujo síncrono actual
+    #   - Cancelación durante el streaming (generation mismatch)
+
+    def test_pipeline_streaming_success(self, patched_assistant):
+        """Flujo streaming exitoso: send_command_stream + synthesize_sentence_stream
+        + play_audio_stream se invocan en orden. NO se llama send_command (síncrono).
+        """
+        # Forzar streaming habilitado (la fixture usa mock_settings sin esta key,
+        # por lo que el __init__ toma el default True desde el settings.json real)
+        patched_assistant._streaming_enabled = True
+
+        # STT OK
+        patched_assistant._whisper_stt.transcribe.return_value = "abrí chrome"
+
+        # OpenCode streaming: retorna un iter de deltas
+        def delta_iter():
+            yield "[STYLE: cheerful] Hola. "
+            yield "Chau. "
+
+        patched_assistant._opencode.send_command_stream.return_value = delta_iter()
+        # OpenCode send_command (síncrono) NO debe ser llamado
+        patched_assistant._opencode.send_command.return_value = "NO DEBE LLAMARSE"
+
+        # Kokoro streaming: retorna un iter de PCM (1 chunk por oración)
+        pcm_chunks = [b"\x00" * 100, b"\x00" * 100]  # 2 oraciones → 2 chunks
+        patched_assistant._local_tts.synthesize_sentence_stream.return_value = iter(pcm_chunks)
+
+        patched_assistant.run_pipeline("/tmp/fake.wav")
+
+        # Se invocó el flujo streaming
+        patched_assistant._opencode.send_command_stream.assert_called_once_with("abrí chrome")
+        # send_command (síncrono) NO fue llamado
+        patched_assistant._opencode.send_command.assert_not_called()
+        # Kokoro streaming fue invocado
+        patched_assistant._local_tts.synthesize_sentence_stream.assert_called_once()
+        # play_audio_stream recibió los chunks PCM
+        patched_assistant._audio.play_audio_stream.assert_called_once()
+        # play_audio (no streaming) NO fue llamado
+        patched_assistant._audio.play_audio.assert_not_called()
+        # Estado final IDLE
+        assert patched_assistant._state == patched_assistant.STATE_IDLE
+
+    def test_pipeline_streaming_fallback_on_error(self, patched_assistant):
+        """Si ``send_command_stream`` falla → fallback automático al flujo síncrono.
+
+        El pipeline principal envuelve el flujo streaming en un try/except;
+        ante una excepción cae a ``_run_sync_pipeline()``, que usa
+        ``send_command()`` + ``synthesize()`` + ``play_audio()``.
+        """
+        patched_assistant._streaming_enabled = True
+        patched_assistant._whisper_stt.transcribe.return_value = "abrí chrome"
+
+        # OpenCode streaming FALLA
+        patched_assistant._opencode.send_command_stream.side_effect = RuntimeError(
+            "SSE cortado"
+        )
+        # OpenCode síncrono (fallback) retorna respuesta válida
+        patched_assistant._opencode.send_command.return_value = (
+            "[STYLE: cheerful] Listo"
+        )
+        # TTS local síncrono (fallback) retorna PCM
+        pcm = b"\x00" * 48000
+        patched_assistant._local_tts.synthesize.return_value = pcm
+
+        patched_assistant.run_pipeline("/tmp/fake.wav")
+
+        # Se intentó el flujo streaming
+        patched_assistant._opencode.send_command_stream.assert_called_once()
+        # CAYÓ al síncrono: send_command fue llamado
+        patched_assistant._opencode.send_command.assert_called_once_with("abrí chrome")
+        # Kokoro streaming NO fue invocado (estamos en fallback)
+        patched_assistant._local_tts.synthesize_sentence_stream.assert_not_called()
+        # Kokoro síncrono SÍ fue invocado
+        patched_assistant._local_tts.synthesize.assert_called_once()
+        # Se reprodujo por play_audio (no streaming)
+        patched_assistant._audio.play_audio.assert_called_once_with(pcm)
+        patched_assistant._audio.play_audio_stream.assert_not_called()
+        # Estado final IDLE
+        assert patched_assistant._state == patched_assistant.STATE_IDLE
+
+    def test_pipeline_streaming_disabled(self, patched_assistant):
+        """``streaming_enabled=False`` → usa el flujo SÍNCRONO (no streaming).
+
+        Verifica el contrato del setting: cuando streaming_enabled es False,
+        el handler principal va directo a ``_run_sync_pipeline()`` sin
+        intentar el flujo streaming.
+        """
+        # DESHABILITAR streaming
+        patched_assistant._streaming_enabled = False
+
+        patched_assistant._whisper_stt.transcribe.return_value = "abrí chrome"
+        patched_assistant._opencode.send_command.return_value = (
+            "[STYLE: cheerful] Listo"
+        )
+        pcm = b"\x00" * 48000
+        patched_assistant._local_tts.synthesize.return_value = pcm
+
+        patched_assistant.run_pipeline("/tmp/fake.wav")
+
+        # NO se intentó el flujo streaming
+        patched_assistant._opencode.send_command_stream.assert_not_called()
+        # Se usó el flujo síncrono: send_command fue llamado
+        patched_assistant._opencode.send_command.assert_called_once_with("abrí chrome")
+        # Kokoro síncrono fue llamado
+        patched_assistant._local_tts.synthesize.assert_called_once()
+        # Kokoro streaming NO fue invocado
+        patched_assistant._local_tts.synthesize_sentence_stream.assert_not_called()
+        # Reproducción por play_audio
+        patched_assistant._audio.play_audio.assert_called_once_with(pcm)
+        patched_assistant._audio.play_audio_stream.assert_not_called()
+        # Estado final IDLE
+        assert patched_assistant._state == patched_assistant.STATE_IDLE
+
+    def test_pipeline_streaming_cancellation(self, patched_assistant):
+        """Cancelación durante el streaming: ``generation`` cambia mientras se
+        itera el stream → el iter aborta antes de invocar Kokoro.
+
+        Verifica que el chequeo de ``self._pipeline_generation != generation``
+        dentro del ``sentence_iterator()`` aborta correctamente el flujo.
+
+        Para que el test sea realista, mockeamos ``synthesize_sentence_stream``
+        como PROXY del sentence_iterator que recibe: consume el iter (lo que
+        fuerza al ``sentence_iterator`` interno a iterar el delta_stream y
+        disparar la cancelación) pero produce 0 PCM (porque la cancelación
+        abortó antes del primer yield).
+        """
+        patched_assistant._streaming_enabled = True
+        patched_assistant._whisper_stt.transcribe.return_value = "abrí chrome"
+
+        # Stream que incrementa generation al emitir su primer delta (simula
+        # que el usuario presionó Alt+V durante el streaming).
+        def delta_iter():
+            patched_assistant._pipeline_generation += 1  # simula toggle()
+            yield "[STYLE: cheerful] Hola. "  # este yield se descarta por cancel
+            yield "Chau. "  # nunca llega aquí
+
+        patched_assistant._opencode.send_command_stream.return_value = delta_iter()
+
+        # Mock synthesize_sentence_stream como PROXY: consume el sentence_iterator
+        # para forzar la iteración del delta_stream (y disparar la cancelación),
+        # pero produce 0 PCM (la cancelación abortó antes del primer yield).
+        def sentence_stream_proxy(sentences):
+            # Consumir el iter → fuerza avance del sentence_iterator →
+            # fuerza avance del delta_iter → dispara _pipeline_generation += 1
+            # → el sentence_iterator interno aborta por cancellation check.
+            consumed_sentences = list(sentences)
+            # Retornar iter VACÍO: 0 oraciones llegaron a Kokoro.
+            return iter([])
+
+        patched_assistant._local_tts.synthesize_sentence_stream.side_effect = (
+            sentence_stream_proxy
+        )
+
+        patched_assistant.run_pipeline("/tmp/fake.wav")
+
+        # Se intentó el flujo streaming
+        patched_assistant._opencode.send_command_stream.assert_called_once()
+        # Kokoro streaming SÍ se invocó (la pipeline todavía entra al with send_lock)
+        patched_assistant._local_tts.synthesize_sentence_stream.assert_called_once()
+        # El delta_iter SÍ fue consumido (cancellation disparó)
+        assert patched_assistant._pipeline_generation >= 1, (
+            f"Esperaba _pipeline_generation>=1 (cancelación disparada), "
+            f"se obtuvo {patched_assistant._pipeline_generation}"
+        )
+        # play_audio_stream fue llamado (con iter vacío → no reproduce nada)
+        patched_assistant._audio.play_audio_stream.assert_called_once()
+        # El estado NO fue pisado a IDLE por el finally (generación difiere)
+        assert patched_assistant._state != patched_assistant.STATE_IDLE, (
+            f"Esperaba estado != IDLE (cancelación), se obtuvo {patched_assistant._state!r}"
+        )
+        # overlay.hide NO fue llamado (cancelación)
+        patched_assistant._overlay.hide.assert_not_called()

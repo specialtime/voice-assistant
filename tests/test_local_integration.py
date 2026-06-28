@@ -204,6 +204,16 @@ def patched_assistant(env_keys, local_settings, mock_overlay, monkeypatch):
         assistant = VoiceAssistant()
         # Sobrescribir settings con los sintéticos (no tocar el JSON real)
         assistant._settings = local_settings
+        # Forzar flujo síncrono: estos tests verifican el camino síncrono
+        # (send_command + synthesize + play_audio), no el streaming SSE.
+        # El flujo streaming tiene cobertura dedicada en test_state_machine.py
+        # (tests T6-T9: test_pipeline_streaming_*).
+        # El default en config/settings.json es streaming_enabled=True, pero
+        # este fixture no incluye esa key en local_settings['opencode'], por
+        # lo que el orquestador cae al default True del .get(...).
+        # FIX: setear explícitamente False para mantener los tests estables
+        # sin requerir que el JSON real tenga streaming_enabled=false.
+        assistant._streaming_enabled = False
 
         yield assistant
 
