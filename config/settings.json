@@ -29,7 +29,6 @@
     "piper": {
       "voice_model": "es_AR-daniela-high",
       "voices_dir": "models/piper-voices",
-      "download_url_base": "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0",
       "length_scale": 1.0
     }
   },

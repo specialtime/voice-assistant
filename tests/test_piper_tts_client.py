@@ -5,6 +5,7 @@ Sin red, sin disco, sin modelo real.
 """
 
 import io
+import logging
 import os
 import wave
 from unittest.mock import MagicMock, patch
@@ -185,3 +186,33 @@ def test_returns_pcm_not_wav(piper_settings):
         assert not result.startswith(b"RIFF")
         # Debe ser exactamente 200 bytes (100 samples * 2 bytes s16le)
         assert len(result) == 200
+
+
+@pytest.mark.unit
+@patch("handlers.piper_tts_client.piper.PiperVoice")
+@patch("handlers.piper_tts_client.ensure_voice_exists")
+def test_no_secrets_logged(mock_ensure, mock_voice_cls, piper_settings, caplog):
+    """Paths absolutos del usuario NO deben aparecer en logs de PiperTTSClient."""
+    # Configurar voices_dir con un path "sensible"
+    piper_settings["local"]["piper"]["voices_dir"] = "C:\\Users\\SECRET_USER_DO_NOT_LEAK_999\\models"
+
+    mock_voice_cls.load.return_value = MagicMock()
+    mock_voice_inst = MagicMock()
+    mock_voice_cls.load.return_value = mock_voice_inst
+
+    def fake_synthesize(wav_file, text_list, length_scale=1.0):
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(24000)
+        wav_file.writeframes(b"\x00\x01" * 100)
+
+    mock_voice_inst.synthesize.side_effect = fake_synthesize
+
+    with caplog.at_level(logging.DEBUG, logger="handlers.piper_tts_client"):
+        client = PiperTTSClient(piper_settings)
+        client.synthesize("test")
+
+    all_logs = "\n".join(record.getMessage() for record in caplog.records)
+    assert "SECRET_USER_DO_NOT_LEAK_999" not in all_logs, (
+        f"Path absoluto filtrado en logs: {[r.getMessage() for r in caplog.records]}"
+    )

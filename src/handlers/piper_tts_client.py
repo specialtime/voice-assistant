@@ -38,7 +38,7 @@ class PiperTTSClient:
         cfg = settings["local"]["piper"]
         logger.debug(
             "PiperTTSClient inicializado — voice=%s, voices_dir=%s",
-            cfg["voice_model"], cfg["voices_dir"],
+            cfg["voice_model"], os.path.basename(cfg["voices_dir"]),
         )
 
     def _ensure_voice_loaded(self) -> None:
@@ -65,7 +65,7 @@ class PiperTTSClient:
             logger.info("Descargando voz Piper — voice=%s...", voice_model)
             ensure_voice_exists(
                 voices_dir,
-                download_url_base=cfg["download_url_base"],
+                download_url_base="https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0",
                 lang=lang,
                 lang_locale=lang_locale,
                 speaker=speaker,

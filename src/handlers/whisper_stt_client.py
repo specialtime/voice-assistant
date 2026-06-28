@@ -80,7 +80,7 @@ class WhisperSTTClient:
                 beam_size=cfg["beam_size"],
             )
             # segments es un generator — consumir y concatenar
-            text = "".join(seg.text for seg in segments).strip()
+            text = " ".join(seg.text.strip() for seg in segments if seg.text.strip())
         except Exception as exc:
             logger.error("Whisper STT falló — %s: %s", type(exc).__name__, exc)
             raise RuntimeError(f"Whisper STT falló: {exc}") from exc
