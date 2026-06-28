@@ -22,7 +22,8 @@ from handlers.gemini_stt_client import GeminiSTTClient
 from handlers.opencode_client import OpenCodeClient
 from handlers.gemini_tts_client import GeminiTTSClient
 from handlers.azure_tts_client import AzureTTSClient
-from handlers.response_parser import parse_response
+from handlers.response_parser import _strip_markdown, parse_response
+from handlers.sentence_buffer import SentenceBuffer
 from handlers.overlay import OverlayChip
 from handlers.whisper_stt_client import WhisperSTTClient
 from handlers.piper_tts_client import PiperTTSClient
@@ -98,6 +99,7 @@ class VoiceAssistant:
 
         # OpenCode (sin cambios)
         self._opencode = OpenCodeClient(self._settings, opencode_password or "", opencode_base_url) if opencode_base_url else None
+        self._streaming_enabled: bool = self._settings.get("opencode", {}).get("streaming_enabled", True)
 
         if not gemini_key:
             logger.warning("GEMINI_API_KEY no configurada — Gemini STT/TTS fallback no disponible")
@@ -217,66 +219,75 @@ class VoiceAssistant:
                 logger.error("STT retornó texto vacío")
                 return
 
-            # 2. Agente (cerebro) — con send_lock anti-concurrencia
+            # 2. Agente — streaming o síncrono según config
             if self._pipeline_generation != generation:
                 logger.info("Pipeline (gen=%d) cancelado después de STT", generation)
                 return
             if self._opencode is None:
                 logger.error("OpenCode no configurado (OPENCODE_SERVER_PASSWORD faltante)")
                 return
-            with self._send_lock:
-                if self._pipeline_generation != generation:
-                    logger.info("Pipeline (gen=%d) cancelado mientras esperaba send_lock", generation)
-                    return
-                response = self._opencode.send_command(text)
-            logger.debug("Agente respondió: %s", response[:100])
 
-            # 3. Parsear respuesta
-            if self._pipeline_generation != generation:
-                logger.info("Pipeline (gen=%d) cancelado después de send_command", generation)
-                return
-            style_hint, clean_text = parse_response(response)
-            logger.debug("Parseado — style=%s, text=%s", style_hint, clean_text[:100])
-
-            # 4. Transición a SPEAKING antes del TTS+playback
-            if self._pipeline_generation != generation:
-                logger.info("Pipeline (gen=%d) cancelado antes de TTS", generation)
-                return
-            with self._lock:
-                if self._pipeline_generation != generation:
-                    return
-                self._state = self.STATE_SPEAKING
-                self._overlay.set_state("speaking")
-                logger.info("→ SPEAKING (gen=%d)", generation)
-
-            # 5 + 6. TTS — local (primario) → Gemini (fallback 1) → Azure streaming (fallback 2)
-            pcm_bytes = None
-            try:
-                pcm_bytes = self._local_tts.synthesize(clean_text, style_hint)
-                logger.debug("TTS local OK — %d bytes", len(pcm_bytes))
-            except Exception as e:
-                logger.warning("TTS local falló (%s), intentando Gemini fallback", e)
+            if self._streaming_enabled and self._local_tts is not None and hasattr(self._local_tts, 'synthesize_sentence_stream'):
+                # ── Flujo streaming ──
+                prompt_async_sent = False
                 try:
-                    if self._gemini_tts is None:
-                        raise RuntimeError("Gemini TTS no configurado")
-                    if not self._gemini_tts.is_available():
-                        raise RuntimeError("Gemini TTS circuit breaker abierto")
-                    pcm_bytes = self._gemini_tts.synthesize(clean_text, style_hint)
-                    logger.debug("TTS Gemini fallback OK — %d bytes", len(pcm_bytes))
-                except Exception as e2:
-                    logger.warning("Gemini TTS falló (%s), intentando Azure streaming fallback", e2)
-                    if self._azure_tts is None:
-                        logger.error("Azure TTS no configurado (AZURE_SPEECH_KEY faltante)")
-                        return
-                    # Streaming Azure: reproducir en tiempo real (latencia baja al primer sample)
-                    self._audio.play_audio_stream(self._azure_tts.synthesize_stream(clean_text, style_hint))
-                    logger.debug("TTS Azure streaming OK")
-                    # pcm_bytes se queda en None → paso 7 se salta (ya reproducido)
+                    with self._send_lock:
+                        if self._pipeline_generation != generation:
+                            logger.info("Pipeline (gen=%d) cancelado mientras esperaba send_lock", generation)
+                            return
+                        # send_command_stream envía prompt_async internamente.
+                        # Si falla antes de enviar, prompt_async_sent queda False.
+                        delta_stream = self._opencode.send_command_stream(text)
+                        prompt_async_sent = True  # prompt_async fue aceptado (204)
 
-            # 7. Playback (local o Gemini — no streaming)
-            if pcm_bytes:
-                self._audio.play_audio(pcm_bytes)
-                logger.debug("Playback completado")
+                        # 3+4. Transición a SPEAKING antes del primer audio
+                        with self._lock:
+                            if self._pipeline_generation != generation:
+                                return
+                            self._state = self.STATE_SPEAKING
+                            self._overlay.set_state("speaking")
+                            logger.info("→ SPEAKING (gen=%d, streaming)", generation)
+
+                        # 5. Pipeline streaming: deltas → oraciones → Kokoro → playback
+                        sentence_buffer = SentenceBuffer()
+
+                        def sentence_iterator():
+                            for delta in delta_stream:
+                                if self._pipeline_generation != generation:
+                                    logger.info("Pipeline (gen=%d) cancelado durante streaming", generation)
+                                    return
+                                for sentence in sentence_buffer.add(delta):
+                                    yield _strip_markdown(sentence)
+                            # flush final
+                            if self._pipeline_generation != generation:
+                                return
+                            for sentence in sentence_buffer.flush():
+                                yield _strip_markdown(sentence)
+
+                        pcm_stream = self._local_tts.synthesize_sentence_stream(sentence_iterator())
+                        self._audio.play_audio_stream(pcm_stream)
+                        logger.debug("Streaming pipeline completado (gen=%d)", generation)
+
+                except Exception as e:
+                    if prompt_async_sent:
+                        # El agente ya recibió el comando. No reenviar.
+                        logger.warning(
+                            "Streaming falló tras prompt_async (%s: %s). "
+                            "El agente ya está procesando — no se reenvía el comando.",
+                            type(e).__name__, e
+                        )
+                        # Si ya estábamos en SPEAKING, el playback parcial ya ocurrió.
+                        # No hacer fallback síncrono para evitar doble playback.
+                    else:
+                        # prompt_async falló antes de enviar — fallback síncrono seguro.
+                        logger.warning(
+                            "Streaming falló antes de prompt_async (%s: %s), fallback a síncrono",
+                            type(e).__name__, e
+                        )
+                        self._run_sync_pipeline(text, generation)
+            else:
+                # ── Flujo síncrono (no streaming) ──
+                self._run_sync_pipeline(text, generation)
 
         except Exception as e:
             logger.exception("Error en pipeline: %s", e)
@@ -291,6 +302,79 @@ class VoiceAssistant:
                     logger.info("→ IDLE (gen=%d)", generation)
                 else:
                     logger.info("Pipeline (gen=%d) cancelado — no se resetea el estado", generation)
+
+    # ── Pipeline síncrono (fallback) ──────────────────────────────
+
+    def _run_sync_pipeline(self, text: str, generation: int) -> None:
+        """Ejecuta el pipeline síncrono (no streaming) como fallback.
+
+        Flujo: send_command → parse_response → SPEAKING → synthesize → play_audio.
+        Incluye todos los chequeos de _pipeline_generation y el send_lock.
+
+        Args:
+            text: Texto transcrito del usuario.
+            generation: Número de generación para cancelación cooperativa.
+        """
+        # 2. Agente (cerebro) — con send_lock anti-concurrencia
+        if self._pipeline_generation != generation:
+            logger.info("Pipeline (gen=%d) cancelado después de STT", generation)
+            return
+        if self._opencode is None:
+            logger.error("OpenCode no configurado (OPENCODE_SERVER_PASSWORD faltante)")
+            return
+        with self._send_lock:
+            if self._pipeline_generation != generation:
+                logger.info("Pipeline (gen=%d) cancelado mientras esperaba send_lock", generation)
+                return
+            response = self._opencode.send_command(text)
+        logger.debug("Agente respondió: %s", response[:100])
+
+        # 3. Parsear respuesta
+        if self._pipeline_generation != generation:
+            logger.info("Pipeline (gen=%d) cancelado después de send_command", generation)
+            return
+        style_hint, clean_text = parse_response(response)
+        logger.debug("Parseado — style=%s, text=%s", style_hint, clean_text[:100])
+
+        # 4. Transición a SPEAKING antes del TTS+playback
+        if self._pipeline_generation != generation:
+            logger.info("Pipeline (gen=%d) cancelado antes de TTS", generation)
+            return
+        with self._lock:
+            if self._pipeline_generation != generation:
+                return
+            self._state = self.STATE_SPEAKING
+            self._overlay.set_state("speaking")
+            logger.info("→ SPEAKING (gen=%d)", generation)
+
+        # 5 + 6. TTS — local (primario) → Gemini (fallback 1) → Azure streaming (fallback 2)
+        pcm_bytes = None
+        try:
+            pcm_bytes = self._local_tts.synthesize(clean_text, style_hint)
+            logger.debug("TTS local OK — %d bytes", len(pcm_bytes))
+        except Exception as e:
+            logger.warning("TTS local falló (%s), intentando Gemini fallback", e)
+            try:
+                if self._gemini_tts is None:
+                    raise RuntimeError("Gemini TTS no configurado")
+                if not self._gemini_tts.is_available():
+                    raise RuntimeError("Gemini TTS circuit breaker abierto")
+                pcm_bytes = self._gemini_tts.synthesize(clean_text, style_hint)
+                logger.debug("TTS Gemini fallback OK — %d bytes", len(pcm_bytes))
+            except Exception as e2:
+                logger.warning("Gemini TTS falló (%s), intentando Azure streaming fallback", e2)
+                if self._azure_tts is None:
+                    logger.error("Azure TTS no configurado (AZURE_SPEECH_KEY faltante)")
+                    return
+                # Streaming Azure: reproducir en tiempo real (latencia baja al primer sample)
+                self._audio.play_audio_stream(self._azure_tts.synthesize_stream(clean_text, style_hint))
+                logger.debug("TTS Azure streaming OK")
+                # pcm_bytes se queda en None → paso 7 se salta (ya reproducido)
+
+        # 7. Playback (local o Gemini — no streaming)
+        if pcm_bytes:
+            self._audio.play_audio(pcm_bytes)
+            logger.debug("Playback completado")
 
     # ── Loop principal ────────────────────────────────────────────
 

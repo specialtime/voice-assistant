@@ -738,3 +738,125 @@ class TestKokoroChunking:
                     f"len(result)={len(result)}, esperado={expected_bytes_for_n_calls}, "
                     f"n_calls={n_calls}"
                 )
+
+
+# ──────────────────────────────────────────────────────────────────
+# Tests de synthesize_sentence_stream (Micro-Spec Streaming TTS — T8)
+# ──────────────────────────────────────────────────────────────────
+#
+# Cubre el contrato de ``KokoroTTSClient.synthesize_sentence_stream()``:
+# recibe un ``Iterator[str]`` de oraciones y hace yield de PCM completo
+# por cada una. Lazy-load del modelo en la primera iteración.
+
+
+@pytest.mark.unit
+class TestKokoroSynthesizeSentenceStream:
+    """Suite: synthesize_sentence_stream() — yield de PCM por oración."""
+
+    def test_synthesize_sentence_stream_yields_pcm(self, kokoro_settings):
+        """Iterator de 2 oraciones → 2 yields de PCM (uno por oración).
+
+        Cada yield contiene el PCM completo de la oración. El consumidor
+        (``play_audio_stream``) los reproduce en tiempo real.
+        """
+        with patch("handlers.kokoro_tts_client.Path.exists", return_value=True):
+            with patch("handlers.kokoro_tts_client.Kokoro") as MockKokoro:
+                mock_instance = MockKokoro.return_value
+                mock_instance.create = MagicMock(side_effect=_fake_create)
+
+                client = KokoroTTSClient(kokoro_settings)
+
+                def sentence_iter():
+                    yield "Primera oración."
+                    yield "Segunda oración."
+
+                chunks = list(client.synthesize_sentence_stream(sentence_iter()))
+
+                # 2 oraciones → 2 yields de PCM
+                assert len(chunks) == 2
+                for chunk in chunks:
+                    # _fake_create retorna 100 samples float32 → 200 bytes
+                    assert isinstance(chunk, bytes)
+                    assert len(chunk) == 200
+
+                # Kokoro.create fue llamada 2 veces (1 por oración)
+                assert mock_instance.create.call_count == 2
+                # Los textos recibidos son las oraciones
+                received = [c.args[0] for c in mock_instance.create.call_args_list]
+                assert received == ["Primera oración.", "Segunda oración."]
+
+    def test_synthesize_sentence_stream_skips_empty(self, kokoro_settings):
+        """Iterator con oración VACÍA (whitespace) → se saltea.
+
+        El handler chequea ``sentence.strip()`` antes de invocar
+        ``synthesize()``. Una oración ``"   "`` (solo whitespace) NO debe
+        cargar el modelo NI invocar ``Kokoro.create``.
+        """
+        with patch("handlers.kokoro_tts_client.Path.exists", return_value=True):
+            with patch("handlers.kokoro_tts_client.Kokoro") as MockKokoro:
+                mock_instance = MockKokoro.return_value
+                mock_instance.create = MagicMock(side_effect=_fake_create)
+
+                client = KokoroTTSClient(kokoro_settings)
+
+                def sentence_iter():
+                    yield "   "  # whitespace → skip
+                    yield "Real oración."
+
+                chunks = list(client.synthesize_sentence_stream(sentence_iter()))
+
+                # Solo 1 yield (la oración real)
+                assert len(chunks) == 1
+                assert len(chunks[0]) == 200
+
+                # create fue llamada SOLO 1 vez (skip del whitespace)
+                assert mock_instance.create.call_count == 1
+
+    def test_synthesize_sentence_stream_lazy_load(self, kokoro_settings):
+        """Iterator VACÍO → NO se carga el modelo Kokoro.
+
+        El contrato de lazy-load: el modelo solo se carga cuando hay al menos
+        UNA oración real para sintetizar. Un iter vacío es el caso del caller
+        que no llegó a yield-ear ninguna oración (ej: cancelación durante el
+        streaming). NO debe invocar ``Kokoro.create``.
+        """
+        with patch("handlers.kokoro_tts_client.Path.exists", return_value=True):
+            with patch("handlers.kokoro_tts_client.Kokoro") as MockKokoro:
+                mock_instance = MockKokoro.return_value
+                mock_instance.create = MagicMock(side_effect=_fake_create)
+
+                client = KokoroTTSClient(kokoro_settings)
+
+                # Iter vacío
+                def empty_iter():
+                    if False:
+                        yield ""  # pragma: no cover
+
+                chunks = list(client.synthesize_sentence_stream(empty_iter()))
+
+                # Sin yields
+                assert chunks == []
+                # Modelo NO se cargó (create no se invocó)
+                mock_instance.create.assert_not_called()
+
+    def test_synthesize_sentence_stream_single_sentence(self, kokoro_settings):
+        """Iterator de UNA oración → un yield de PCM.
+
+        Caso degenerado: solo una oración para sintetizar.
+        """
+        with patch("handlers.kokoro_tts_client.Path.exists", return_value=True):
+            with patch("handlers.kokoro_tts_client.Kokoro") as MockKokoro:
+                mock_instance = MockKokoro.return_value
+                mock_instance.create = MagicMock(side_effect=_fake_create)
+
+                client = KokoroTTSClient(kokoro_settings)
+
+                def sentence_iter():
+                    yield "Hola mundo"
+
+                chunks = list(client.synthesize_sentence_stream(sentence_iter()))
+
+                # Exactamente 1 yield
+                assert len(chunks) == 1
+                assert len(chunks[0]) == 200
+                assert mock_instance.create.call_count == 1

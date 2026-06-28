@@ -23,8 +23,8 @@ Asistente de voz en segundo plano para Windows que interactúa con el sistema op
 **Pipeline de un comando:**
 1. **Trigger:** `Alt+V` activa grabación.
 2. **STT:** Audio → Whisper local (`small`, GPU) con fallback a Gemini (`gemini-3.1-flash-lite`).
-3. **Razonamiento:** Texto → OpenCode (agente `asistente_voz`).
-4. **TTS:** Respuesta SSML → TTS local (Piper `es_AR-daniela-high` o Kokoro `em_alex`, seleccionable via `settings.json`, CPU) con fallback a Gemini → Azure → altavoces.
+3. **Razonamiento (streaming):** Texto → OpenCode vía `prompt_async` + stream SSE `/event`. Los tokens del agente se reciben en tiempo real sin esperar la respuesta completa.
+4. **TTS (streaming por oración):** Los deltas de texto se acumulan en un `SentenceBuffer` que emite oraciones completas. Cada oración se sintetiza con Kokoro/Piper y se reproduce vía `play_audio_stream` en tiempo real. Fallback a flujo síncrono (respuesta completa → sintetizar todo → reproducir) si el streaming falla antes de enviar el prompt.
 
 **Por qué proceso usuario (no servicio):** un asistente de voz necesita desktop (overlay tkinter), audio (micrófono/altavoces) y hotkey global. Los servicios de Windows corren en Session 0 (aislada, sin desktop desde Vista) — no pueden mostrar ventanas ni lanzar programas visibles. Correr todo en Session 1 es más simple y funciona correctamente.
 
@@ -55,12 +55,13 @@ dev-cortex/
 │       ├── audio_manager.py     #   Grabación y reproducción de audio
 │       ├── whisper_stt_client.py #  STT local (Whisper, GPU, primario)
 │       ├── gemini_stt_client.py #   STT cloud (Gemini, fallback)
-│       ├── opencode_client.py   #   Cliente del cerebro (OpenCode serve)
+│       ├── opencode_client.py   #   Cliente del cerebro (OpenCode serve, streaming SSE + síncrono)
 │       ├── piper_tts_client.py  #   TTS local (Piper, CPU, seleccionable)
-│       ├── kokoro_tts_client.py #   TTS local (Kokoro, CPU, seleccionable)
+│       ├── kokoro_tts_client.py #   TTS local (Kokoro, CPU, seleccionable, streaming por oración)
 │       ├── gemini_tts_client.py #   TTS cloud (Gemini, fallback 1)
 │       ├── azure_tts_client.py  #   TTS cloud (Azure, fallback 2 streaming)
 │       ├── response_parser.py  #   Parser de respuestas SSML
+│       ├── sentence_buffer.py  #   Buffer de oraciones para streaming (acumula deltas SSE)
 │       └── overlay.py           #   Overlay visual (chip tkinter)
 └── tests/                      # Suite de tests
     ├── conftest.py             # Fixtures compartidas + markers
@@ -200,6 +201,36 @@ Para usar Kokoro en vez de Piper:
 > **Normalización de texto:** El handler de Kokoro colapsa cualquier secuencia de whitespace (newlines, tabs, espacios múltiples) a un solo espacio antes de sintetizar, y deshabilita el `trim` de silencios finales de kokoro-onnx. Esto previene el WARNING `phonemizer: words count mismatch` cuando el agente devuelve texto multilinea (ej. listas con saltos de línea) y evita que el audio se corte abruptamente al final. Ver `specs/bug_kokoro_phonemizer_mismatch.md`.
 
 > **Chunking de textos largos:** `kokoro-onnx` 0.5.0 tiene un límite de 510 phonemas por batch y su `_split_phonemes` interno solo splitea en `[.,!?;]` (no en `:`, `—`, `/`), lo que causa `IndexError: index 510 is out of bounds` con textos largos (ej. agenda semanal). El handler splitea el texto por puntuación fuerte (`.,;:!?—–/`) antes de llamar a `create()`, con un safety net de 1500 chars para chunks sin puntuación, y concatena el audio resultante. Ver `specs/bug_kokoro_chunking_510_phonemes.md`.
+
+### Streaming TTS (latencia reducida)
+
+El pipeline soporta **streaming end-to-end** que reduce drásticamente la latencia al primer audio hablado. En lugar de esperar a que el agente termine de generar toda la respuesta para recién ahí sintetizar y reproducir, el streaming:
+
+1. Envía el prompt al agente vía `POST /session/:id/prompt_async` (retorna 204 inmediatamente).
+2. Se suscribe al stream SSE `GET /event` de OpenCode serve para recibir tokens en tiempo real.
+3. Acumula los deltas de texto en un `SentenceBuffer` que emite oraciones completas (split por `. ! ? ;`).
+4. Cada oración se sintetiza con Kokoro y se reproduce vía `play_audio_stream` en tiempo real.
+
+**Latencia al primer audio** = T(STT) + T(primer token del agente) + T(primer oración) + T(Kokoro 1 oración).
+
+**Configuración** (`config/settings.json` → `opencode`):
+
+| Campo | Default | Descripción |
+|---|---|---|
+| `streaming_enabled` | `true` | Activa el flujo streaming. Si `false`, usa el flujo síncrono tradicional. |
+| `streaming_timeout_seconds` | `120` | Timeout absoluto del stream SSE. Si el agente no termina en este tiempo, se cierra el stream. |
+
+**Fallback automático:** si `prompt_async` falla antes de enviar el comando al agente, cae al flujo síncrono (`send_command` → `synthesize` → `play_audio`). Si el streaming falla después de que el agente ya recibió el comando, no se reenvía (se loguea el error y termina).
+
+**Eventos SSE relevantes** (OpenCode serve v1.17.11, schema legacy):
+
+| Evento | Campo clave | Significado |
+|---|---|---|
+| `session.next.text.delta` | `properties.delta` | Fragmento de texto incremental |
+| `session.idle` | `properties.sessionID` | Fin de la generación |
+| `session.error` | `properties.error` | Error del agente |
+
+Ver `specs/feature_streaming_tts_kokoro.md` para el diseño completo.
 
 ### 5. Levantar el servidor OpenCode
 

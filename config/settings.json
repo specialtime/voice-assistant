@@ -11,7 +11,9 @@
     "agent": "asistente_voz",
     "model_fallback": "opencode/big-pickle",
     "timeout_ms": 120000,
-    "max_session_messages": 10
+    "max_session_messages": 10,
+    "streaming_enabled": true,
+    "streaming_timeout_seconds": 120
   },
   "azure": {
     "voice": "es-MX-JorgeNeural",
