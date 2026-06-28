@@ -522,9 +522,19 @@ class OpenCodeClient:
         if resolved_session_id != session_id:
             return [], False
 
-        if event_type == "session.next.text.delta":
-            # Acepta delta en properties.delta (v1) o data.field.text (v2)
-            delta = properties.get("delta") or data_field.get("field", {}).get("text", "")
+        if event_type in ("session.next.text.delta", "message.part.delta"):
+            # Acepta delta en properties.delta (v1) o data.delta (v2).
+            # Para ``session.next.text.delta`` también se acepta el legacy
+            # ``data.field.text`` por compatibilidad con servers v2 viejos.
+            # Para ``message.part.delta`` el payload es:
+            #   {"sessionID":"...","messageID":"...","partID":"...","field":"text","delta":"..."}
+            # donde ``field`` es el nombre del campo modificado (string) y
+            # ``delta`` es top-level. Ver https://github.com/BloopAI/vibe-kanban/issues/3123.
+            delta = (
+                properties.get("delta")
+                or data_field.get("delta")
+                or data_field.get("field", {}).get("text", "")
+            )
             if delta:
                 return [delta], False
             return [], False
