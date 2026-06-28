@@ -1,5 +1,5 @@
 @echo off
-cd /d "%~dp0"
+cd /d "%~dp0\.."
 
 :: Variables de entorno para DEV (override de los defaults de prod)
 set CORTEX_OPENCODE_DIR=C:\Users\crist\.cortex-dev
