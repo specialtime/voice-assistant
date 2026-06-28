@@ -1,0 +1,34 @@
+{
+  "gemini": {
+    "stt_model_primary": "gemini-3.1-flash-lite",
+    "stt_model_fallback": "gemini-2.5-flash-lite",
+    "tts_model": "gemini-3.1-flash-tts-preview",
+    "tts_voice": "Charon",
+    "tts_circuit_breaker_cooldown_seconds": 1800,
+    "stt_prompt": "Transcribe el siguiente audio al español rioplatense. Elimina balbuceos, muletillas y repeticiones. Aplica puntuación correcta. Devuelve ÚNICAMENTE el texto transcrito, sin comentarios ni prefijos."
+  },
+  "opencode": {
+    "agent": "asistente_voz",
+    "model_fallback": "opencode/big-pickle",
+    "timeout_ms": 120000,
+    "max_session_messages": 10
+  },
+  "azure": {
+    "voice": "es-MX-JorgeNeural",
+    "locale": "es-MX",
+    "output_format": "raw-24khz-16bit-mono-pcm"
+  },
+  "audio": {
+    "sample_rate": 24000,
+    "channels": 1,
+    "sample_width": 2,
+    "recording_filename": "comando.wav"
+  },
+  "hotkey": "alt+v",
+  "logging": {
+    "filename": "logs/cortex.log",
+    "max_bytes": 5242880,
+    "backup_count": 3,
+    "level": "DEBUG"
+  }
+}
