@@ -23,9 +23,14 @@
     "whisper": {
       "model": "small",
       "device": "cuda",
-      "compute_type": "int8",
+      "compute_type": "int8_float16",
       "language": "es",
-      "beam_size": 5
+      "beam_size": 5,
+      "vad_filter": true,
+      "vad_min_silence_duration_ms": 500,
+      "initial_prompt": "Comandos de voz en español rioplatense. Términos técnicos: Chrome, VSCode, terminal, git, PowerShell, opencode, Python, Docker.",
+      "hotwords": "Chrome VSCode PowerShell opencode Python Docker terminal git",
+      "condition_on_previous_text": false
     },
     "piper": {
       "voice_model": "es_AR-daniela-high",

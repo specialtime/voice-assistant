@@ -98,6 +98,12 @@ class WhisperSTTClient:
                 wav_path,
                 language=cfg["language"],
                 beam_size=cfg["beam_size"],
+                vad_filter=cfg.get("vad_filter", False),
+                vad_parameters=dict(min_silence_duration_ms=cfg.get("vad_min_silence_duration_ms", 500))
+                    if cfg.get("vad_filter") else None,
+                initial_prompt=cfg.get("initial_prompt"),
+                hotwords=cfg.get("hotwords"),
+                condition_on_previous_text=cfg.get("condition_on_previous_text", True),
             )
             # segments es un generator — consumir y concatenar
             text = " ".join(seg.text.strip() for seg in segments if seg.text.strip())
