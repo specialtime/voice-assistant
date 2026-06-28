@@ -722,6 +722,14 @@ class TestVoiceAssistantStateMachine:
         fuerza al ``sentence_iterator`` interno a iterar el delta_stream y
         disparar la cancelación) pero produce 0 PCM (porque la cancelación
         abortó antes del primer yield).
+
+        Contrato del fix ``fe33e29`` (overlay speaking prematuro):
+        Como la cancelación ocurre ANTES del primer chunk PCM real, el wrapper
+        ``pcm_stream_with_speaking_transition`` aborta sin transicionar a
+        ``STATE_SPEAKING``. El estado del orquestador queda en su valor previo
+        (en este test, ``STATE_IDLE`` porque no hubo ``toggle()`` previo). El
+        bloque ``finally`` además NO resetea el estado porque la generación
+        difiere (cancelación detectada).
         """
         patched_assistant._streaming_enabled = True
         patched_assistant._whisper_stt.transcribe.return_value = "abrí chrome"
@@ -763,9 +771,25 @@ class TestVoiceAssistantStateMachine:
         )
         # play_audio_stream fue llamado (con iter vacío → no reproduce nada)
         patched_assistant._audio.play_audio_stream.assert_called_once()
-        # El estado NO fue pisado a IDLE por el finally (generación difiere)
-        assert patched_assistant._state != patched_assistant.STATE_IDLE, (
-            f"Esperaba estado != IDLE (cancelación), se obtuvo {patched_assistant._state!r}"
+        # FIX ``fe33e29``: la transición a SPEAKING ahora ocurre SOLO al primer
+        # chunk PCM real. Como la cancelación abortó antes del primer chunk,
+        # el wrapper nunca transicionó → ``overlay.set_state("speaking")`` NO
+        # se invoca y el estado queda intacto (IDLE en este test porque no
+        # hubo ``toggle()`` previo). El bloque ``finally`` tampoco lo resetea
+        # porque detecta que la generación difiere (rama de cancelación).
+        assert patched_assistant._state == patched_assistant.STATE_IDLE, (
+            f"Esperaba estado=IDLE (sin transición a SPEAKING por cancelación "
+            f"pre-PCM), se obtuvo {patched_assistant._state!r}"
         )
-        # overlay.hide NO fue llamado (cancelación)
+        # overlay.set_state("speaking") NO fue llamado (la cancelación ocurrió
+        # antes del primer chunk PCM real).
+        speaking_calls = [
+            c for c in patched_assistant._overlay.set_state.call_args_list
+            if c.args and c.args[0] == "speaking"
+        ]
+        assert speaking_calls == [], (
+            f"set_state('speaking') no debe llamarse en cancelación pre-PCM, "
+            f"se llamó {len(speaking_calls)}: {speaking_calls}"
+        )
+        # overlay.hide NO fue llamado por el finally (cancelación detectada).
         patched_assistant._overlay.hide.assert_not_called()
