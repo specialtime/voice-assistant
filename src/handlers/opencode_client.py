@@ -329,29 +329,43 @@ class OpenCodeClient:
                 stream_opened = True
                 data_buffer = ""
 
-                # Consumir el primer evento (server.connected) para confirmar
-                # que la suscripción está activa antes de enviar el prompt.
-                # Si no llega en un tiempo razonable, timeout del stream.
+                # FIX StreamConsumed (commit de fix/stream-consumed-sse):
+                # El bug original llamaba ``stream_response.iter_lines()`` dos
+                # veces sobre el mismo ``httpx.Response``. La primera llamada
+                # (en el ``while not connected_seen``) marca el stream interno
+                # como consumido (``iter_raw`` setea ``is_stream_consumed=True``
+                # antes de la primera iteración) y la segunda llamada
+                # (``for line_bytes in stream_response.iter_lines()``)
+                # levantaba ``httpx.StreamConsumed``.
+                #
+                # Fix: un único ``for line_bytes in iter_lines()`` que consume
+                # TODO el stream. ``prompt_async`` se envía en cuanto se ve el
+                # primer evento completo (típicamente ``server.connected``),
+                # preservando el orden subscribe→prompt_async del commit
+                # ``9790971`` y el filtro anti-stale (que vive en
+                # ``_process_sse_event``, commit ``43c506e``).
                 connected_seen = False
-                while not connected_seen:
+                prompt_async_sent = False
+                saw_done = False
+
+                # Consumir TODO el stream con un único iter_lines().
+                for line_bytes in stream_response.iter_lines():
                     if time.monotonic() - start_time > streaming_timeout:
                         logger.warning(
-                            "Stream SSE: timeout esperando server.connected tras %ds — cerrando",
+                            "Stream SSE excedió timeout de %ds — cerrando (%d deltas)",
                             streaming_timeout,
+                            delta_count,
                         )
-                        raise RuntimeError("Stream SSE no se inicializó")
-
-                    line_bytes = next(stream_response.iter_lines(), None)
-                    if line_bytes is None:
-                        # Stream cerrado por el server sin server.connected
-                        logger.warning("Stream SSE cerrado por server antes de server.connected")
-                        raise RuntimeError("Stream SSE cerrado prematuramente")
+                        break
 
                     line = line_bytes.decode("utf-8") if isinstance(line_bytes, bytes) else line_bytes
+
                     if line.startswith("data: "):
-                        data_buffer += line[6:]
-                    elif line == "" and data_buffer:
-                        # Primer evento: procesar (puede ser server.connected u otro)
+                        data_buffer += line[6:]  # acumular JSON sin prefijo
+                        continue
+
+                    if line == "" and data_buffer:
+                        # Fin de un evento SSE: procesarlo.
                         deltas, done = self._process_sse_event(
                             data_buffer, session_id, delta_count
                         )
@@ -361,71 +375,65 @@ class OpenCodeClient:
                                 first_delta_logged = True
                             delta_count += 1
                             yield delta
-                        # No debe haber session.idle aquí, pero por las dudas
                         if done:
-                            logger.debug("session.idle recibido antes de prompt_async — cerrando")
-                            return  # sale del with → finally ejecuta compactación
-                        data_buffer = ""
-                        connected_seen = True  # cualquier primer evento válido
-
-                # --- Paso 4: POST prompt_async (suscripción ya activa) ---
-                try:
-                    response = self._client.post(
-                        f"/session/{session_id}/prompt_async", json=body
-                    )
-                    response.raise_for_status()
-                    logger.debug(
-                        "prompt_async enviado y stream /event ya suscrito — race window cerrado"
-                    )
-                except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.RequestError) as exc:
-                    logger.error(
-                        "prompt_async falló (post-subscribe) — %s: %s",
-                        type(exc).__name__,
-                        exc,
-                    )
-                    raise RuntimeError("prompt_async falló") from exc
-
-                # --- Paso 5-8: Leer el resto del stream ---
-                for line_bytes in stream_response.iter_lines():
-                    line = line_bytes.decode("utf-8") if isinstance(line_bytes, bytes) else line_bytes
-
-                    if line == "":
-                        # Línea vacía → fin de evento SSE
-                        if data_buffer:
-                            deltas, done = self._process_sse_event(
-                                data_buffer, session_id, delta_count
-                            )
-                            for delta in deltas:
-                                if not first_delta_logged:
-                                    logger.debug("Primer delta recibido: %r", delta)
-                                    first_delta_logged = True
-                                delta_count += 1
-                                yield delta
-                            if done:
+                            if not connected_seen:
+                                # session.idle ANTES de prompt_async: caso raro
+                                # (no debería pasar — server.connected siempre
+                                # es el primer evento), pero por las dudas.
                                 logger.debug(
-                                    "session.idle válido recibido — cerrando stream SSE (%d deltas)",
-                                    delta_count,
+                                    "session.idle recibido antes de prompt_async — cerrando"
                                 )
+                                saw_done = True
                                 break
-                            data_buffer = ""
-                        continue
+                            logger.debug(
+                                "session.idle válido recibido — cerrando stream SSE (%d deltas)",
+                                delta_count,
+                            )
+                            saw_done = True
+                            break
+                        data_buffer = ""
 
-                    if line.startswith("data: "):
-                        data_buffer += line[6:]  # acumular JSON sin prefijo
-                    # Ignorar otras líneas (event:, id:, comentarios :)
+                        # --- Paso 3→4: enviar prompt_async tras confirmar
+                        #     suscripción (primer evento completo visto).
+                        if not connected_seen:
+                            connected_seen = True
+                            try:
+                                response = self._client.post(
+                                    f"/session/{session_id}/prompt_async",
+                                    json=body,
+                                )
+                                response.raise_for_status()
+                                prompt_async_sent = True
+                                logger.debug(
+                                    "prompt_async enviado y stream /event ya suscrito"
+                                    " — race window cerrado"
+                                )
+                            except (
+                                httpx.HTTPStatusError,
+                                httpx.TimeoutException,
+                                httpx.RequestError,
+                            ) as exc:
+                                logger.error(
+                                    "prompt_async falló (post-subscribe) — %s: %s",
+                                    type(exc).__name__,
+                                    exc,
+                                )
+                                raise RuntimeError("prompt_async falló") from exc
 
-                    # Timeout absoluto del stream
-                    if time.monotonic() - start_time > streaming_timeout:
-                        logger.warning(
-                            "Stream SSE excedió timeout de %ds — cerrando (%d deltas)",
-                            streaming_timeout,
-                            delta_count,
-                        )
-                        break
+                    # line == "" sin data_buffer (separador entre eventos): ignorar
+                    # Otras líneas (event:, id:, comentarios): ignorar
 
-                # Fin del stream: procesar cualquier evento residual
-                if data_buffer:
-                    deltas, done = self._process_sse_event(
+                # Fin del stream sin haber visto server.connected ni enviado prompt_async
+                if not connected_seen and not saw_done:
+                    logger.warning(
+                        "Stream SSE cerrado por server antes de cualquier evento — "
+                        "subscription no confirmada"
+                    )
+                    raise RuntimeError("Stream SSE cerrado prematuramente")
+
+                # Fin del stream: procesar cualquier evento residual en data_buffer
+                if data_buffer and not saw_done:
+                    deltas, _ = self._process_sse_event(
                         data_buffer, session_id, delta_count
                     )
                     for delta in deltas:

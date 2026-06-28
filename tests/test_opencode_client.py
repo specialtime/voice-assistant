@@ -854,3 +854,96 @@ class TestOpenCodeClient:
             f"prompt_async_idx={prompt_async_idx}. El stream DEBE abrirse "
             f"ANTES que prompt_async para cerrar la race window."
         )
+
+    # ──────────────────────────────────────────────────────────────────
+    # Regression: httpx.StreamConsumed (bug fix/stream-consumed-sse)
+    # ──────────────────────────────────────────────────────────────────
+    @patch("handlers.opencode_client.httpx.Client")
+    def test_send_command_stream_iter_lines_called_once(
+        self, mock_client_cls, mock_settings
+    ):
+        """Regression: ``send_command_stream`` debe invocar ``iter_lines()`` UNA SOLA VEZ.
+
+        Bug original: el handler llamaba ``stream_response.iter_lines()`` dos veces
+        sobre el mismo ``httpx.Response``:
+
+        - Primera llamada: dentro de ``while not connected_seen`` para consumir
+          el evento ``server.connected`` y confirmar la suscripción.
+        - Segunda llamada: dentro de ``for line_bytes in stream_response.iter_lines()``
+          para procesar el resto de deltas y ``session.idle``.
+
+        ``httpx.Response.iter_raw()`` setea ``is_stream_consumed = True`` antes
+        de la primera iteración, por lo que la segunda llamada a ``iter_lines()``
+        (que pasa por ``iter_text()`` → ``iter_bytes()`` → ``iter_raw()``) levanta
+        ``httpx.StreamConsumed`` y aborta el stream con cero deltas emitidos.
+
+        Este test monta un mock que reproduce fielmente ese comportamiento de
+        httpx: la segunda invocación de ``iter_lines()`` levanta
+        ``StreamConsumed``. Con el código viejo, el test falla. Con el fix
+        (un único ``for line_bytes in iter_lines()``), el test pasa.
+        """
+        mock_client = mock_client_cls.return_value
+        mock_client.post.side_effect = [
+            _ok_response({"id": "ses_reg"}),  # ensure_session
+            self._ok_post(204),               # prompt_async
+        ]
+
+        # Stream SSE con un server.connected + 2 deltas + session.idle
+        sse_lines = [
+            b'data: {"id":"c","type":"server.connected","properties":{}}',
+            b'',
+            b'data: {"id":"d1","type":"session.next.text.delta",'
+            b'"properties":{"sessionID":"ses_reg","delta":"Hola"}}',
+            b'',
+            b'data: {"id":"d2","type":"session.next.text.delta",'
+            b'"properties":{"sessionID":"ses_reg","delta":" mundo"}}',
+            b'',
+            b'data: {"id":"d3","type":"session.idle",'
+            b'"properties":{"sessionID":"ses_reg"}}',
+            b'',
+        ]
+
+        # Mock que reproduce el comportamiento de httpx real:
+        # iter_lines() devuelve un iter NUEVO cada vez, pero la segunda
+        # invocación levanta StreamConsumed (porque iter_raw agotó el stream).
+        iter_for_lines = iter(sse_lines)
+
+        def iter_lines_side_effect():
+            """Primera llamada OK, segunda llamada → StreamConsumed."""
+            iter_lines_side_effect.call_count += 1
+            if iter_lines_side_effect.call_count == 1:
+                return iter(iter_for_lines)
+            # Segunda invocación: simula lo que hace httpx real
+            raise httpx.StreamConsumed()
+
+        iter_lines_side_effect.call_count = 0
+
+        def iter_lines_stream_consumed():
+            """Segunda invocación → StreamConsumed (httpx 0.27.x)."""
+            raise httpx.StreamConsumed()
+
+        iter_lines_side_effect.consumed = iter_lines_stream_consumed
+
+        mock_stream = MagicMock(name="StreamResponse")
+        mock_stream.__enter__.return_value = mock_stream
+        mock_stream.__exit__.return_value = False
+        mock_stream.raise_for_status = MagicMock()
+        mock_stream.iter_lines.side_effect = iter_lines_side_effect
+        mock_client.stream.return_value = mock_stream
+
+        client = OpenCodeClient(mock_settings, "fake_pass", _BASE_URL)
+
+        # Antes del fix: esto lanzaba httpx.StreamConsumed al re-iterar.
+        # Después del fix: un solo iter_lines() consume todo el stream → OK.
+        deltas = list(client.send_command_stream("hola"))
+
+        assert deltas == ["Hola", " mundo"], (
+            f"Esperaba ['Hola', ' mundo'], obtuve {deltas}. "
+            "Si el test falla con StreamConsumed, alguien revirtió el fix "
+            "que unifica los dos iter_lines() en uno solo."
+        )
+        # Verificar explícitamente que iter_lines() se invoca UNA SOLA VEZ
+        assert iter_lines_side_effect.call_count == 1, (
+            f"iter_lines() fue invocado {iter_lines_side_effect.call_count} "
+            "veces — debe ser exactamente 1 (bug StreamConsumed si es >1)."
+        )
