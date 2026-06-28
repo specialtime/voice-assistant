@@ -227,10 +227,14 @@ El pipeline soporta **streaming end-to-end** que reduce drásticamente la latenc
 | Evento | Campo clave | Significado |
 |---|---|---|
 | `session.next.text.delta` | `properties.delta` | Fragmento de texto incremental |
+| `message.part.updated` | `properties.part.type` | Metadata de part (`text`, `reasoning`, `tool`, etc.) — se usa para filtrar |
+| `message.part.delta` | `properties.delta`, `properties.partID` | Fragmento incremental de un part — se filtra por tipo |
 | `session.idle` | `properties.sessionID` | Fin de la generación |
 | `session.error` | `properties.error` | Error del agente |
 
-Ver `specs/feature_streaming_tts_kokoro.md` para el diseño completo.
+**Filtrado de reasoning:** OpenCode emite deltas tanto para la respuesta al usuario (parts de tipo `text`) como para la cadena de pensamiento del agente (parts de tipo `reasoning`), output de herramientas (`tool`), etc. El cliente `opencode_client.py` trackea `partID → part.type` via `message.part.updated` y **solo emite al TTS los deltas de parts de tipo `text`**. Los tipos `reasoning`, `tool`, `file`, `step-start`, `step-finish`, `compaction` y `subtask` se descartan. Si el server no emite `message.part.updated` (compatibilidad con servers viejos), los deltas se emiten por defecto.
+
+Ver `specs/feature_streaming_tts_kokoro.md` para el diseño completo del streaming y `specs/bug_tts-reasoning-leak.md` para el detalle del filtrado de reasoning.
 
 ### 5. Levantar el servidor OpenCode
 
