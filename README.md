@@ -26,6 +26,8 @@ Asistente de voz en segundo plano para Windows que interactúa con el sistema op
 3. **Razonamiento:** Texto → OpenCode (agente `asistente_voz`).
 4. **TTS:** Respuesta SSML → Azure/Gemini → altavoces.
 
+**Por qué proceso usuario (no servicio):** un asistente de voz necesita desktop (overlay tkinter), audio (micrófono/altavoces) y hotkey global. Los servicios de Windows corren en Session 0 (aislada, sin desktop desde Vista) — no pueden mostrar ventanas ni lanzar programas visibles. Correr todo en Session 1 es más simple y funciona correctamente.
+
 ---
 
 ## Estructura del Proyecto
@@ -34,21 +36,18 @@ Asistente de voz en segundo plano para Windows que interactúa con el sistema op
 dev-cortex/
 ├── .env / .env.example        # Credenciales (NO commitear .env)
 ├── .gitignore
+├── AGENTS.md                  # Guía para agentes que trabajan en el código
 ├── README.md                  # Este archivo
 ├── requirements.txt            # Dependencias Python
 ├── config/
 │   └── settings.json           # Configuración de modelos, audio, logging
-├── docs/                       # Documentación técnica
-│   ├── AUTOARRANQUE.md         # Configuración de inicio automático (Task Scheduler)
-│   ├── ESPECIFICACION_TECNICA.md  # Spec técnica completa del proyecto
-│   └── TESTING.md              # Guía de tests (suite, markers, cobertura)
 ├── scripts/                    # Scripts de operaciones
 │   ├── start_cortex.bat        # Arranque completo (opencode + orquestador)
 │   ├── start-dev.bat           # Arranque en modo desarrollo
 │   ├── stop-cortex.ps1         # Detener procesos
 │   ├── deploy.ps1              # Deploy / instalación
 │   └── cleanup_voz_sessions.py # Limpieza de sesiones de voz
-├── specs/                      # Especificaciones por feature/bug (vacío)
+├── specs/                      # Especificaciones por feature/bug
 ├── src/                        # Código fuente
 │   ├── __init__.py
 │   ├── main.py                 # Punto de entrada + máquina de estados
@@ -57,12 +56,11 @@ dev-cortex/
 │       ├── gemini_stt_client.py #   STT (Speech-to-Text) con Gemini
 │       ├── opencode_client.py   #   Cliente del cerebro (OpenCode serve)
 │       ├── gemini_tts_client.py #   TTS con Gemini (fallback)
-│       ├── azure_tts_client.py #   TTS con Azure Cognitive Services
+│       ├── azure_tts_client.py  #   TTS con Azure Cognitive Services
 │       ├── response_parser.py  #   Parser de respuestas SSML
 │       └── overlay.py           #   Overlay visual (chip tkinter)
 └── tests/                      # Suite de tests
-    ├── __init__.py
-    ├── conftest.py             # Fixtures compartidas
+    ├── conftest.py             # Fixtures compartidas + markers
     ├── requirements-test.txt   # Dependencias de testing
     ├── test_audio_manager.py
     ├── test_e2e_scenarios.py
@@ -156,15 +154,58 @@ scripts\start_cortex.bat
 |---|---|
 | Iniciar todo (opencode + orquestador) | `scripts\start_cortex.bat` |
 | Iniciar en modo desarrollo | `scripts\start-dev.bat` |
-| Detener procesos | `scripts\stop-cortex.ps1` |
+| Detener procesos | `powershell -ExecutionPolicy Bypass -File scripts\stop-cortex.ps1` |
 | Detener manualmente | `taskkill /f /im pythonw.exe` |
 | Activar grabación | `Alt+V` (toggle) |
 
 ---
 
-## Tests
+## Autoarranque (inicio automático con Task Scheduler)
 
-Ver documentación completa en [`docs/TESTING.md`](docs/TESTING.md).
+Configura el Programador de Tareas para que ejecute `start_cortex.bat` al iniciar sesión. El bat lanza automáticamente:
+1. `pythonw.exe start_opencode_hidden.py` — opencode serve en background (invisible, con auto-restart).
+2. `pythonw.exe src\main.py` — orquestador con overlay visual.
+
+### Crear la tarea
+
+1. Presionar `Win + R`, escribir `taskschd.msc` y presionar Enter.
+2. Hacer clic en **"Crear tarea..."** en el panel derecho.
+
+**Pestaña "General":**
+- **Nombre:** `Cortex`
+- ✅ **Ejecutar solo cuando el usuario haya iniciado sesión**
+- ✅ **Ejecutar con los privilegios más altos** (necesario para el hotkey `keyboard`)
+
+**Pestaña "Desencadenadores:**
+- **Iniciar la tarea:** `Al iniciar sesión` (At log on)
+- **Estado:** `Habilitado`
+
+**Pestaña "Acciones":**
+- **Acción:** `Iniciar un programa`
+- **Programa o script:** ruta a `start_cortex.bat`
+- **Iniciar en:** ruta al directorio del proyecto
+
+**Pestaña "Condiciones":**
+- Desmarcar **"Iniciar la tarea solo si el equipo está conectado a la alimentación de CA"** (para notebooks).
+
+3. Guardar (puede pedir contraseña).
+
+### Verificación
+
+1. **Reiniciar la PC** (o cerrar sesión y volver a iniciar).
+2. **Esperar 10 segundos** después de iniciar sesión.
+3. **Presionar `Alt+V`:** debe aparecer el chip "● Grabando...".
+4. **Verificar procesos:** `tasklist /FI "IMAGENAME eq pythonw.exe"` debe mostrar 2 procesos pythonw.exe.
+5. **Verificar logs:** `logs\cortex.log` y `logs\opencode-wrapper.log` deben tener entradas.
+
+### Desinstalación
+
+1. Abrir Programador de Tareas → buscar "Cortex" → clic derecho → "Eliminar".
+2. `taskkill /f /im pythonw.exe` para detener procesos.
+
+---
+
+## Tests
 
 ```powershell
 # Tests unitarios (sin red)
@@ -175,15 +216,16 @@ pytest tests/ -m e2e -v
 
 # Cobertura
 pytest tests/ --cov=handlers --cov=main -v
+
+# Un solo archivo
+pytest tests/test_state_machine.py -v
 ```
 
----
+- **Correr siempre desde la raíz del repo** — `conftest.py` resuelve paths relativos a `config/settings.json`.
+- **Markers:** `unit` (sin red, mocks), `e2e` (API keys reales + servidor), `integration` (reservado).
+- **E2E auto-skip:** si faltan env vars o el servidor no responde, los tests E2E hacen `pytest.skip()`. Son seguros en CI.
 
-## Documentación
-
-- [`docs/ESPECIFICACION_TECNICA.md`](docs/ESPECIFICACION_TECNICA.md) — Spec técnica completa (arquitectura, stack, fases).
-- [`docs/AUTOARRANQUE.md`](docs/AUTOARRANQUE.md) — Configuración de inicio automático con Task Scheduler.
-- [`docs/TESTING.md`](docs/TESTING.md) — Guía de tests (suite, markers, cobertura).
+Detalle técnico de la suite (cobertura por módulo, tests de secrets) en [`AGENTS.md`](AGENTS.md).
 
 ---
 
@@ -191,13 +233,13 @@ pytest tests/ --cov=handlers --cov=main -v
 
 | Problema | Solución |
 |---|---|
-| El chip no aparece | Ejecutar `python src\main.py` en terminal para ver errores |
-| opencode no responde (WinError 10061) | Verificar `opencode serve` levantado y puerto 57214 libre |
-| Hotkey no funciona | El Programador de Tareas necesita "privilegios más altos" |
-| No hay respuesta de voz | Verificar `.env`, LM Studio y `logs/cortex.log` |
-| El agente no abre programas | Usar esquema URI para apps de Store (`whatsapp:`, `spotify:`) |
-
-Más detalle en [`docs/AUTOARRANQUE.md`](docs/AUTOARRANQUE.md) sección Troubleshooting.
+| El chip no aparece | Ejecutar `python src\main.py` en terminal (con `python.exe`, no `pythonw.exe`) para ver errores en consola. Revisar `logs\cortex.log`. |
+| opencode no responde (WinError 10061) | Verificar `opencode serve` levantado y puerto 57214 libre (`netstat -ano \| findstr 57214`). Revisar `logs\opencode-wrapper.log`. |
+| Hotkey no funciona | El Programador de Tareas necesita "privilegios más altos" — la librería `keyboard` requiere admin para hooks globales. |
+| No hay respuesta de voz | Verificar `.env`, LM Studio (Qwen3.5-2b) y `logs\cortex.log`. Verificar `curl http://127.0.0.1:57214/global/health` → `{"healthy":true}`. |
+| El agente no abre programas | Usar esquema URI para apps de Store (`whatsapp:`, `spotify:`). Probar `start chrome`, `start notepad`, `start explorer`. |
+| "pythonw.exe no se reconoce" | `where pythonw.exe` — si no aparece, reinstalar Python marcando "Add Python to PATH". |
+| Logs crecen demasiado | Rotan automáticamente cada 5 MB con 3 backups. Editar `config/settings.json` → `logging.max_bytes` y `backup_count`. |
 
 ---
 
