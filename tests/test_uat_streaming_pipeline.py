@@ -72,7 +72,12 @@ for _p in (str(_SRC), str(_PROJECT_ROOT)):
 # defensivamente: si no está, el test de integración debe hacer ``skip()``
 # y no romper la colección.
 
-if "kokoro_onnx" not in sys.modules:
+try:
+    import kokoro_onnx  # noqa: F401 — verificar si está instalado
+except ImportError:
+    # kokoro_onnx no instalado → inyectar stub para que la colección
+    # de pytest no rompa al importar KokoroTTSClient (que hace
+    # `from kokoro_onnx import Kokoro` top-level).
     import types
     from unittest.mock import MagicMock
 
@@ -121,9 +126,13 @@ def _whisper_available() -> bool:
     cache_root = Path.home() / ".cache" / "huggingface" / "hub"
     if not cache_root.exists():
         return False
-    # Buscar cualquier directorio que matchee el patrón del modelo small
-    # (configurado en settings.json: model="small" → "models--guillaumekln--faster-whisper-small")
+    # Buscar cualquier directorio que matchee el patrón del modelo small.
+    # faster_whisper puede usar dos prefijos de hub distintos según la versión:
+    #   - "guillaumekln" (legacy, hasta faster-whisper ~0.9)
+    #   - "Systran" (actual, desde faster-whisper ~0.10)
+    # Aceptamos ambos para no romper el skip en entornos con versiones distintas.
     matches = list(cache_root.glob("models--guillaumekln--faster-whisper-*"))
+    matches += list(cache_root.glob("models--Systran--faster-whisper-*"))
     return len(matches) > 0
 
 
