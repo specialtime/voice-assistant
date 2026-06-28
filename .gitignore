@@ -39,8 +39,9 @@ Thumbs.db
 htmlcov/
 .tox/
 
-# --- Modelos locales (Whisper, Piper) ---
+# --- Modelos locales (Whisper, Piper, Kokoro) ---
 models/
+models/kokoro/
 
 # --- Config local de opencode ---
 .opencode-voz/

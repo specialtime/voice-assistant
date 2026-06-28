@@ -1,6 +1,6 @@
 ﻿# Dev-Cortex — Asistente de Voz para Windows
 
-Asistente de voz en segundo plano para Windows que interactúa con el sistema operativo mediante lenguaje natural. Arquitectura "Dos Cerebros" con aislamiento estricto: el orquestador Python captura audio, transcribe con Whisper (local) o Gemini (cloud fallback), razona con OpenCode y responde con TTS Piper (local) o Azure/Gemini (cloud fallback).
+Asistente de voz en segundo plano para Windows que interactúa con el sistema operativo mediante lenguaje natural. Arquitectura "Dos Cerebros" con aislamiento estricto: el orquestador Python captura audio, transcribe con Whisper (local) o Gemini (cloud fallback), razona con OpenCode y responde con TTS local (Piper o Kokoro, seleccionable) o Azure/Gemini (cloud fallback).
 
 ---
 
@@ -24,7 +24,7 @@ Asistente de voz en segundo plano para Windows que interactúa con el sistema op
 1. **Trigger:** `Alt+V` activa grabación.
 2. **STT:** Audio → Whisper local (`small`, GPU) con fallback a Gemini (`gemini-3.1-flash-lite`).
 3. **Razonamiento:** Texto → OpenCode (agente `asistente_voz`).
-4. **TTS:** Respuesta SSML → Piper local (`es_AR-daniela-high`, CPU) con fallback a Gemini → Azure → altavoces.
+4. **TTS:** Respuesta SSML → TTS local (Piper `es_AR-daniela-high` o Kokoro `em_alex`, seleccionable via `settings.json`, CPU) con fallback a Gemini → Azure → altavoces.
 
 **Por qué proceso usuario (no servicio):** un asistente de voz necesita desktop (overlay tkinter), audio (micrófono/altavoces) y hotkey global. Los servicios de Windows corren en Session 0 (aislada, sin desktop desde Vista) — no pueden mostrar ventanas ni lanzar programas visibles. Correr todo en Session 1 es más simple y funciona correctamente.
 
@@ -56,7 +56,8 @@ dev-cortex/
 │       ├── whisper_stt_client.py #  STT local (Whisper, GPU, primario)
 │       ├── gemini_stt_client.py #   STT cloud (Gemini, fallback)
 │       ├── opencode_client.py   #   Cliente del cerebro (OpenCode serve)
-│       ├── piper_tts_client.py  #   TTS local (Piper, CPU, primario)
+│       ├── piper_tts_client.py  #   TTS local (Piper, CPU, seleccionable)
+│       ├── kokoro_tts_client.py #   TTS local (Kokoro, CPU, seleccionable)
 │       ├── gemini_tts_client.py #   TTS cloud (Gemini, fallback 1)
 │       ├── azure_tts_client.py  #   TTS cloud (Azure, fallback 2 streaming)
 │       ├── response_parser.py  #   Parser de respuestas SSML
@@ -73,6 +74,7 @@ dev-cortex/
     ├── test_opencode_wrapper.py
     ├── test_overlay.py
     ├── test_piper_tts_client.py #  Tests Piper TTS local
+├── test_kokoro_tts_client.py #  Tests Kokoro TTS local
     ├── test_response_parser.py
     ├── test_state_machine.py
     ├── test_tts_clients.py
@@ -143,6 +145,33 @@ python -c "from piper.download_voices import download_voice; from pathlib import
 ```
 
 > **Hardware mínimo:** 4GB VRAM para Whisper small en GPU. Piper corre en CPU. Si no tienes GPU, Whisper cae a CPU (más lento pero funcional).
+
+**TTS — Kokoro local (kokoro-onnx, alternativa):**
+
+Kokoro es una alternativa de TTS local basada en StyleTTS 2. A diferencia de Piper:
+- **Licencia:** MIT (kokoro-onnx) + Apache 2.0 (modelo) — más permisiva que Piper (GPL-3.0).
+- **Calidad:** Mayor naturalidad según benchmarks (MOS 4.3-4.5 vs 3.8-4.0 de Piper).
+- **Descarga:** Manual (no auto-download). Requiere 2 archivos (~300MB total).
+- **Voces españolas:** `em_alex` (masculina, default), `em_santa` (masculina), `ef_dora` (femenina).
+
+Para usar Kokoro en vez de Piper:
+
+1. Instalar deps: `pip install -r requirements.txt` (incluye `kokoro-onnx` y `misaki`).
+2. Descargar modelo y voces:
+   ```powershell
+   mkdir models\kokoro
+   curl -L -o models\kokoro\kokoro-v1.0.onnx https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx
+   curl -L -o models\kokoro\voices-v1.0.bin https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
+   ```
+3. Cambiar el selector en `config/settings.json`:
+   ```json
+   "local": {
+     "tts_engine": "kokoro",
+     ...
+   }
+   ```
+
+> **Nota:** Si el campo `tts_engine` falta o es inválido, se usa `"piper"` por defecto (backward-compatible).
 
 ### 5. Levantar el servidor OpenCode
 
@@ -282,7 +311,7 @@ Detalle técnico de la suite (cobertura por módulo, tests de secrets) en [`AGEN
 | STT primario | Whisper local (`faster-whisper`, modelo `small`, GPU CUDA, int8) |
 | STT fallback | Google AI Studio — `gemini-3.1-flash-lite` (fallback: `gemini-2.5-flash-lite`) |
 | Cerebro | OpenCode serve (agente `asistente_voz`, bash + memoria) |
-| TTS primario | Piper local (`piper-tts`, voz `es_AR-daniela-high`, ONNX Runtime, CPU) |
+| TTS primario | Local seleccionable: Piper (`piper-tts`, voz `es_AR-daniela-high`) o Kokoro (`kokoro-onnx`, voz `em_alex`), ONNX Runtime, CPU |
 | TTS fallback 1 | Gemini (`gemini-3.1-flash-tts-preview`, voz `Charon`) |
 | TTS fallback 2 | Azure Cognitive Services (SSML, `es-MX-JorgeNeural`, streaming) |
 | Memoria | Plugin `opencode-mem` (BD vectorial local) |

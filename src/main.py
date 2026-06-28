@@ -26,6 +26,7 @@ from handlers.response_parser import parse_response
 from handlers.overlay import OverlayChip
 from handlers.whisper_stt_client import WhisperSTTClient
 from handlers.piper_tts_client import PiperTTSClient
+from handlers.kokoro_tts_client import KokoroTTSClient
 
 logger = logging.getLogger(__name__)
 
@@ -78,8 +79,20 @@ class VoiceAssistant:
         self._whisper_stt = WhisperSTTClient(self._settings)
         self._stt = GeminiSTTClient(self._settings, gemini_key) if gemini_key else None
 
-        # TTS: Piper local (primario), Gemini (fallback 1), Azure (fallback 2)
-        self._piper_tts = PiperTTSClient(self._settings)
+        # TTS local: selector de motor (piper | kokoro)
+        tts_engine = self._settings.get("local", {}).get("tts_engine", "piper")
+        if tts_engine not in ("piper", "kokoro"):
+            logger.warning("tts_engine='%s' inválido, usando 'piper' por defecto", tts_engine)
+            tts_engine = "piper"
+
+        if tts_engine == "kokoro":
+            self._local_tts = KokoroTTSClient(self._settings)
+            logger.info("TTS local: Kokoro (selector)")
+        else:
+            self._local_tts = PiperTTSClient(self._settings)
+            logger.info("TTS local: Piper (selector)")
+
+        # TTS cloud fallback (sin cambios)
         self._gemini_tts = GeminiTTSClient(self._settings, gemini_key) if gemini_key else None
         self._azure_tts = AzureTTSClient(self._settings, azure_key, azure_region) if azure_key else None
 
@@ -236,13 +249,13 @@ class VoiceAssistant:
                 self._overlay.set_state("speaking")
                 logger.info("→ SPEAKING (gen=%d)", generation)
 
-            # 5 + 6. TTS — Piper local (primario) → Gemini (fallback 1) → Azure streaming (fallback 2)
+            # 5 + 6. TTS — local (primario) → Gemini (fallback 1) → Azure streaming (fallback 2)
             pcm_bytes = None
             try:
-                pcm_bytes = self._piper_tts.synthesize(clean_text, style_hint)
-                logger.debug("TTS Piper OK — %d bytes", len(pcm_bytes))
+                pcm_bytes = self._local_tts.synthesize(clean_text, style_hint)
+                logger.debug("TTS local OK — %d bytes", len(pcm_bytes))
             except Exception as e:
-                logger.warning("Piper TTS falló (%s), intentando Gemini fallback", e)
+                logger.warning("TTS local falló (%s), intentando Gemini fallback", e)
                 try:
                     if self._gemini_tts is None:
                         raise RuntimeError("Gemini TTS no configurado")
@@ -260,7 +273,7 @@ class VoiceAssistant:
                     logger.debug("TTS Azure streaming OK")
                     # pcm_bytes se queda en None → paso 7 se salta (ya reproducido)
 
-            # 7. Playback (Piper o Gemini — no streaming)
+            # 7. Playback (local o Gemini — no streaming)
             if pcm_bytes:
                 self._audio.play_audio(pcm_bytes)
                 logger.debug("Playback completado")

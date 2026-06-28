@@ -19,6 +19,7 @@
     "output_format": "raw-24khz-16bit-mono-pcm"
   },
   "local": {
+    "tts_engine": "piper",
     "whisper": {
       "model": "small",
       "device": "cuda",
@@ -30,6 +31,13 @@
       "voice_model": "es_AR-daniela-high",
       "voices_dir": "models/piper-voices",
       "length_scale": 1.0
+    },
+    "kokoro": {
+      "model_path": "models/kokoro/kokoro-v1.0.onnx",
+      "voices_path": "models/kokoro/voices-v1.0.bin",
+      "voice": "em_alex",
+      "lang": "es",
+      "speed": 1.0
     }
   },
   "audio": {

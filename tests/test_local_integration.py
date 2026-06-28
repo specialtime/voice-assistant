@@ -4,7 +4,8 @@ Verifica end-to-end (sin red, sin GPU) que ``VoiceAssistant.run_pipeline``
 compone correctamente la cadena de fallback del orquestador:
 
     STT:  Whisper (local, primario)  →  Gemini (cloud, fallback)
-    TTS:  Piper  (local, primario)  →  Gemini (cloud, fallback 1)
+    TTS:  _local_tts (piper|kokoro, local primario)
+        → Gemini (cloud, fallback 1)
         → Azure streaming (cloud, fallback 2)
 
 Casos cubiertos (todos ``@pytest.mark.unit``):
@@ -16,16 +17,18 @@ Casos cubiertos (todos ``@pytest.mark.unit``):
     6. test_tts_piper_gemini_fail_azure_streaming
     7. test_tts_all_fail_no_playback
     8. test_pipeline_full_local_success
+    9. Selector de motor TTS (piper | kokoro) — TestTTSEngineSelector
 
 Implementación técnica:
-    ``faster_whisper`` y ``piper`` no están instalados en este entorno
-    (los wheels de ``av``/``onnxruntime`` no se construyen en Windows con
-    Python 3.14). Para evitar errores de ``import`` top-level en los
-    handlers locales, registramos ``MagicMock`` en ``sys.modules`` ANTES
-    de importar ``main`` o cualquier handler. Esto preserva el contrato
-    de los handlers (sus tests originales mockean con ``@patch`` dentro
-    de cada test) y permite que el orquestador se instancie sin tocar
-    dependencias reales.
+    ``faster_whisper``, ``piper`` y ``kokoro_onnx`` no están instalados
+    en este entorno (los wheels de ``av``/``onnxruntime`` no se
+    construyen en Windows con Python 3.14). Para evitar errores de
+    ``import`` top-level en los handlers locales, registramos
+    ``MagicMock`` en ``sys.modules`` ANTES de importar ``main`` o
+    cualquier handler. Esto preserva el contrato de los handlers (sus
+    tests originales mockean con ``@patch`` dentro de cada test) y
+    permite que el orquestador se instancie sin tocar dependencias
+    reales.
 
     Patrón inspirado en ``tests/test_state_machine.py::patched_assistant``
     (misma idea, fixture local y auto-contenida para evitar acoplamiento
@@ -90,6 +93,11 @@ def _ensure_stub_modules() -> None:
         sys.modules["piper"] = piper_stub
         sys.modules["piper.download_voices"] = piper_download_stub
 
+    if "kokoro_onnx" not in sys.modules:
+        kokoro_stub = types.ModuleType("kokoro_onnx")
+        kokoro_stub.Kokoro = MagicMock(name="Kokoro")
+        sys.modules["kokoro_onnx"] = kokoro_stub
+
 
 _ensure_stub_modules()
 
@@ -121,6 +129,7 @@ def local_settings(mock_settings: dict) -> dict:
     """
     settings = dict(mock_settings)
     settings["local"] = {
+        "tts_engine": "piper",
         "whisper": {
             "model": "small",
             "device": "cuda",
@@ -133,6 +142,13 @@ def local_settings(mock_settings: dict) -> dict:
             "voices_dir": "models/piper-voices",
             "download_url_base": "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0",
             "length_scale": 1.0,
+        },
+        "kokoro": {
+            "model_path": "models/kokoro/kokoro-v1.0.onnx",
+            "voices_path": "models/kokoro/voices-v1.0.bin",
+            "voice": "em_alex",
+            "lang": "es",
+            "speed": 1.0,
         },
     }
     return settings
@@ -168,12 +184,13 @@ def patched_assistant(env_keys, local_settings, mock_overlay, monkeypatch):
         mp.setattr("main.GeminiSTTClient", MagicMock(name="GeminiSTTClient"))
         mp.setattr("main.WhisperSTTClient", MagicMock(name="WhisperSTTClient"))
         mp.setattr("main.PiperTTSClient", MagicMock(name="PiperTTSClient"))
+        mp.setattr("main.KokoroTTSClient", MagicMock(name="KokoroTTSClient"))
         mp.setattr("main.AudioManager", MagicMock(name="AudioManager"))
         mp.setattr("main.load_dotenv", lambda: None)
 
         # Re-leer las clases mockeadas ya configuradas como ``return_value``
         from main import AzureTTSClient, GeminiTTSClient, OpenCodeClient, GeminiSTTClient
-        from main import WhisperSTTClient, PiperTTSClient, AudioManager, VoiceAssistant
+        from main import WhisperSTTClient, PiperTTSClient, KokoroTTSClient, AudioManager, VoiceAssistant
 
         AudioManager.return_value = MagicMock(name="AudioManagerInstance")
         GeminiSTTClient.return_value = MagicMock(name="GeminiSTTClientInstance")
@@ -181,6 +198,7 @@ def patched_assistant(env_keys, local_settings, mock_overlay, monkeypatch):
         OpenCodeClient.return_value = MagicMock(name="OpenCodeClientInstance")
         GeminiTTSClient.return_value = MagicMock(name="GeminiTTSClientInstance")
         PiperTTSClient.return_value = MagicMock(name="PiperTTSClientInstance")
+        KokoroTTSClient.return_value = MagicMock(name="KokoroTTSClientInstance")
         AzureTTSClient.return_value = MagicMock(name="AzureTTSClientInstance")
 
         assistant = VoiceAssistant()
@@ -224,7 +242,7 @@ class TestSTTFailoverChain:
         # Arrange
         _wire_successful_agent(patched_assistant, text="abrí chrome")
         # Piper OK para no chocar con la rama TTS (este test es de STT)
-        patched_assistant._piper_tts.synthesize.return_value = b"\x00" * 48000
+        patched_assistant._local_tts.synthesize.return_value = b"\x00" * 48000
 
         # Act
         patched_assistant.run_pipeline("/tmp/fake.wav")
@@ -244,7 +262,7 @@ class TestSTTFailoverChain:
         patched_assistant._whisper_stt.transcribe.side_effect = RuntimeError("CUDA OOM")
         patched_assistant._stt.transcribe.return_value = "abrí chrome"
         patched_assistant._opencode.send_command.return_value = "[STYLE: cheerful] Listo"
-        patched_assistant._piper_tts.synthesize.return_value = b"\x00" * 48000
+        patched_assistant._local_tts.synthesize.return_value = b"\x00" * 48000
 
         # Act
         patched_assistant.run_pipeline("/tmp/fake.wav")
@@ -274,7 +292,7 @@ class TestSTTFailoverChain:
         patched_assistant._whisper_stt.transcribe.assert_called_once()
         patched_assistant._stt.transcribe.assert_called_once()
         patched_assistant._opencode.send_command.assert_not_called()
-        patched_assistant._piper_tts.synthesize.assert_not_called()
+        patched_assistant._local_tts.synthesize.assert_not_called()
         assert patched_assistant._state == patched_assistant.STATE_IDLE
 
 
@@ -287,15 +305,15 @@ class TestTTSFailoverChain:
         # Arrange
         _wire_successful_agent(patched_assistant)
         pcm = b"\x00" * 48000
-        patched_assistant._piper_tts.synthesize.return_value = pcm
+        patched_assistant._local_tts.synthesize.return_value = pcm
 
         # Act
         patched_assistant.run_pipeline("/tmp/fake.wav")
 
         # Assert
-        patched_assistant._piper_tts.synthesize.assert_called_once()
+        patched_assistant._local_tts.synthesize.assert_called_once()
         # Texto limpio (sin prefijo [STYLE:]) va a Piper
-        piper_args = patched_assistant._piper_tts.synthesize.call_args
+        piper_args = patched_assistant._local_tts.synthesize.call_args
         assert piper_args.args[0] == "Listo, abrí Chrome"
         # Gemini y Azure NO se invocan
         patched_assistant._gemini_tts.synthesize.assert_not_called()
@@ -310,7 +328,7 @@ class TestTTSFailoverChain:
         """Piper falla → Gemini TTS OK → no se invoca Azure, sí ``play_audio``."""
         # Arrange
         _wire_successful_agent(patched_assistant)
-        patched_assistant._piper_tts.synthesize.side_effect = RuntimeError("Piper falló")
+        patched_assistant._local_tts.synthesize.side_effect = RuntimeError("Piper falló")
         pcm = b"\x00" * 48000
         patched_assistant._gemini_tts.synthesize.return_value = pcm
         patched_assistant._gemini_tts.is_available.return_value = True
@@ -319,7 +337,7 @@ class TestTTSFailoverChain:
         patched_assistant.run_pipeline("/tmp/fake.wav")
 
         # Assert
-        patched_assistant._piper_tts.synthesize.assert_called_once()
+        patched_assistant._local_tts.synthesize.assert_called_once()
         patched_assistant._gemini_tts.is_available.assert_called_once()
         patched_assistant._gemini_tts.synthesize.assert_called_once()
         # Texto limpio va a Gemini (mismo que a Piper)
@@ -340,7 +358,7 @@ class TestTTSFailoverChain:
         """
         # Arrange
         _wire_successful_agent(patched_assistant)
-        patched_assistant._piper_tts.synthesize.side_effect = RuntimeError("Piper falló")
+        patched_assistant._local_tts.synthesize.side_effect = RuntimeError("Piper falló")
         patched_assistant._gemini_tts.synthesize.side_effect = RuntimeError("Gemini TTS falló")
         patched_assistant._gemini_tts.is_available.return_value = True
         # Azure streaming: retorna iterator de chunks PCM
@@ -351,7 +369,7 @@ class TestTTSFailoverChain:
         patched_assistant.run_pipeline("/tmp/fake.wav")
 
         # Assert
-        patched_assistant._piper_tts.synthesize.assert_called_once()
+        patched_assistant._local_tts.synthesize.assert_called_once()
         patched_assistant._gemini_tts.is_available.assert_called_once()
         patched_assistant._gemini_tts.synthesize.assert_called_once()
         # Azure streaming recibe el texto limpio
@@ -380,7 +398,7 @@ class TestTTSFailoverChain:
         """
         # Arrange
         _wire_successful_agent(patched_assistant)
-        patched_assistant._piper_tts.synthesize.side_effect = RuntimeError("Piper falló")
+        patched_assistant._local_tts.synthesize.side_effect = RuntimeError("Piper falló")
         patched_assistant._gemini_tts.is_available.return_value = True
         patched_assistant._gemini_tts.synthesize.side_effect = RuntimeError("Gemini TTS falló")
         patched_assistant._azure_tts.synthesize_stream.side_effect = RuntimeError(
@@ -392,7 +410,7 @@ class TestTTSFailoverChain:
             patched_assistant.run_pipeline("/tmp/fake.wav")
 
         # Assert
-        patched_assistant._piper_tts.synthesize.assert_called_once()
+        patched_assistant._local_tts.synthesize.assert_called_once()
         patched_assistant._gemini_tts.synthesize.assert_called_once()
         patched_assistant._azure_tts.synthesize_stream.assert_called_once()
         # Sin playback por ninguna vía
@@ -409,7 +427,7 @@ class TestTTSFailoverChain:
         """
         # Arrange
         _wire_successful_agent(patched_assistant)
-        patched_assistant._piper_tts.synthesize.side_effect = RuntimeError("Piper falló")
+        patched_assistant._local_tts.synthesize.side_effect = RuntimeError("Piper falló")
         patched_assistant._gemini_tts.is_available.return_value = True
         patched_assistant._gemini_tts.synthesize.side_effect = RuntimeError("Gemini TTS falló")
         # Forzar Azure None (escenario "no configurado")
@@ -420,7 +438,7 @@ class TestTTSFailoverChain:
             patched_assistant.run_pipeline("/tmp/fake.wav")
 
         # Assert
-        patched_assistant._piper_tts.synthesize.assert_called_once()
+        patched_assistant._local_tts.synthesize.assert_called_once()
         patched_assistant._gemini_tts.synthesize.assert_called_once()
         # Sin playback por ninguna vía
         patched_assistant._audio.play_audio.assert_not_called()
@@ -443,7 +461,7 @@ class TestTTSFailoverChain:
         """
         # Arrange
         _wire_successful_agent(patched_assistant)
-        patched_assistant._piper_tts.synthesize.side_effect = RuntimeError("Piper falló")
+        patched_assistant._local_tts.synthesize.side_effect = RuntimeError("Piper falló")
         patched_assistant._gemini_tts.is_available.return_value = False
         fake_pcm_chunks = [b"\x00\x01" * 50]
         patched_assistant._azure_tts.synthesize_stream.return_value = iter(fake_pcm_chunks)
@@ -474,7 +492,7 @@ class TestPipelineFullLocal:
         """
         # Arrange
         _wire_successful_agent(patched_assistant, text="abrí chrome")
-        patched_assistant._piper_tts.synthesize.return_value = b"\x00" * 48000
+        patched_assistant._local_tts.synthesize.return_value = b"\x00" * 48000
 
         # Act
         patched_assistant.run_pipeline("/tmp/fake.wav")
@@ -483,7 +501,7 @@ class TestPipelineFullLocal:
         patched_assistant._whisper_stt.transcribe.assert_called_once()
         patched_assistant._stt.transcribe.assert_not_called()  # Gemini STT no se llama
         patched_assistant._opencode.send_command.assert_called_once_with("abrí chrome")
-        patched_assistant._piper_tts.synthesize.assert_called_once()
+        patched_assistant._local_tts.synthesize.assert_called_once()
         patched_assistant._gemini_tts.synthesize.assert_not_called()  # Gemini TTS no se llama
         patched_assistant._azure_tts.synthesize_stream.assert_not_called()  # Azure no se llama
 
@@ -496,3 +514,295 @@ class TestPipelineFullLocal:
 
         # El overlay se ocultó (cleanup del finally)
         patched_assistant._overlay.hide.assert_called_once()
+
+
+# ──────────────────────────────────────────────────────────────────
+# Selector de motor TTS local (piper | kokoro)
+#
+# Estos tests verifican que ``VoiceAssistant.__init__`` elige el motor
+# TTS correcto según ``settings['local']['tts_engine']``. Como el
+# orquestador lee ``config/settings.json`` del disco durante la
+# construcción, los tests mockean ``builtins.open`` para inyectar un
+# settings sintético sin tocar el archivo real.
+# ──────────────────────────────────────────────────────────────────
+
+
+def _build_kokoro_settings_dict() -> dict:
+    """Helper: settings con ``tts_engine='kokoro'`` para tests de selector."""
+    return {
+        "gemini": {
+            "stt_model_primary": "gemini-3.1-flash-lite",
+            "stt_model_fallback": "gemini-2.5-flash-lite",
+            "tts_model": "gemini-3.1-flash-tts-preview",
+            "tts_voice": "Charon",
+            "tts_circuit_breaker_cooldown_seconds": 1800,
+            "stt_prompt": "test",
+        },
+        "opencode": {
+            "agent": "asistente_voz",
+            "model_fallback": "opencode/big-pickle",
+            "timeout_ms": 120000,
+            "max_session_messages": 10,
+        },
+        "azure": {
+            "voice": "es-MX-JorgeNeural",
+            "locale": "es-MX",
+            "output_format": "raw-24khz-16bit-mono-pcm",
+        },
+        "local": {
+            "tts_engine": "kokoro",
+            "whisper": {
+                "model": "small",
+                "device": "cuda",
+                "compute_type": "int8",
+                "language": "es",
+                "beam_size": 5,
+            },
+            "piper": {
+                "voice_model": "es_AR-daniela-high",
+                "voices_dir": "models/piper-voices",
+                "length_scale": 1.0,
+            },
+            "kokoro": {
+                "model_path": "models/kokoro/kokoro-v1.0.onnx",
+                "voices_path": "models/kokoro/voices-v1.0.bin",
+                "voice": "em_alex",
+                "lang": "es",
+                "speed": 1.0,
+            },
+        },
+        "audio": {
+            "sample_rate": 24000,
+            "channels": 1,
+            "sample_width": 2,
+            "recording_filename": "comando.wav",
+        },
+        "hotkey": "alt+v",
+        "logging": {
+            "filename": "logs/cortex.log",
+            "max_bytes": 5242880,
+            "backup_count": 3,
+            "level": "DEBUG",
+        },
+    }
+
+
+def _build_piper_settings_dict() -> dict:
+    """Helper: settings con ``tts_engine='piper'`` (default) para tests de selector."""
+    s = _build_kokoro_settings_dict()
+    s["local"]["tts_engine"] = "piper"
+    return s
+
+
+def _build_invalid_engine_settings_dict() -> dict:
+    """Helper: settings con ``tts_engine='invalid'`` → debe caer a piper."""
+    s = _build_kokoro_settings_dict()
+    s["local"]["tts_engine"] = "invalid_engine_xyz"
+    return s
+
+
+@pytest.mark.unit
+class TestTTSEngineSelector:
+    """Suite: selector de motor TTS local (piper | kokoro).
+
+    Verifica que ``VoiceAssistant.__init__`` instancia el cliente TTS
+    correcto según ``settings['local']['tts_engine']`` y que el valor
+    inválido cae con warning al default (piper).
+    """
+
+    def test_selector_piper_default(self, patched_assistant):
+        """``tts_engine='piper'`` (default) → ``_local_tts`` se construye
+        vía ``PiperTTSClient`` y ``KokoroTTSClient`` NUNCA se instancia."""
+        # Assert: el selector eligió Piper, no Kokoro
+        from main import PiperTTSClient, KokoroTTSClient
+
+        PiperTTSClient.assert_called_once()
+        KokoroTTSClient.assert_not_called()
+        # El atributo ``_local_tts`` debe ser la instancia mock de Piper
+        assert patched_assistant._local_tts is PiperTTSClient.return_value
+
+    def test_selector_kokoro(self, env_keys, mock_overlay, monkeypatch):
+        """``tts_engine='kokoro'`` → ``_local_tts`` se construye vía
+        ``KokoroTTSClient`` y ``PiperTTSClient`` NUNCA se instancia."""
+        import json
+        from unittest.mock import mock_open
+
+        monkeypatch.chdir(_PROJECT_ROOT)
+
+        kokoro_settings = _build_kokoro_settings_dict()
+        m = mock_open(read_data=json.dumps(kokoro_settings))
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("main.AzureTTSClient", MagicMock(name="AzureTTSClient"))
+            mp.setattr("main.GeminiTTSClient", MagicMock(name="GeminiTTSClient"))
+            mp.setattr("main.OpenCodeClient", MagicMock(name="OpenCodeClient"))
+            mp.setattr("main.GeminiSTTClient", MagicMock(name="GeminiSTTClient"))
+            mp.setattr("main.WhisperSTTClient", MagicMock(name="WhisperSTTClient"))
+            mp.setattr("main.PiperTTSClient", MagicMock(name="PiperTTSClient"))
+            mp.setattr("main.KokoroTTSClient", MagicMock(name="KokoroTTSClient"))
+            mp.setattr("main.AudioManager", MagicMock(name="AudioManager"))
+            mp.setattr("main.load_dotenv", lambda: None)
+            # Mockear open() para devolver JSON con tts_engine='kokoro'
+            mp.setattr("builtins.open", m)
+
+            from main import (
+                VoiceAssistant,
+                PiperTTSClient,
+                KokoroTTSClient,
+                AudioManager,
+            )
+
+            AudioManager.return_value = MagicMock(name="AudioManagerInstance")
+            PiperTTSClient.return_value = MagicMock(name="PiperTTSClientInstance")
+            KokoroTTSClient.return_value = MagicMock(name="KokoroTTSClientInstance")
+
+            assistant = VoiceAssistant()
+
+            # Assert: el selector eligió Kokoro, no Piper
+            KokoroTTSClient.assert_called_once()
+            PiperTTSClient.assert_not_called()
+            assert assistant._local_tts is KokoroTTSClient.return_value
+
+    def test_selector_invalid_falls_back_to_piper(
+        self, env_keys, mock_overlay, monkeypatch, caplog
+    ):
+        """``tts_engine='invalid_xyz'`` → warning logueado y ``PiperTTSClient`` se instancia."""
+        import json
+        from unittest.mock import mock_open
+
+        monkeypatch.chdir(_PROJECT_ROOT)
+
+        invalid_settings = _build_invalid_engine_settings_dict()
+        m = mock_open(read_data=json.dumps(invalid_settings))
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("main.AzureTTSClient", MagicMock(name="AzureTTSClient"))
+            mp.setattr("main.GeminiTTSClient", MagicMock(name="GeminiTTSClient"))
+            mp.setattr("main.OpenCodeClient", MagicMock(name="OpenCodeClient"))
+            mp.setattr("main.GeminiSTTClient", MagicMock(name="GeminiSTTClient"))
+            mp.setattr("main.WhisperSTTClient", MagicMock(name="WhisperSTTClient"))
+            mp.setattr("main.PiperTTSClient", MagicMock(name="PiperTTSClient"))
+            mp.setattr("main.KokoroTTSClient", MagicMock(name="KokoroTTSClient"))
+            mp.setattr("main.AudioManager", MagicMock(name="AudioManager"))
+            mp.setattr("main.load_dotenv", lambda: None)
+            mp.setattr("builtins.open", m)
+
+            from main import (
+                VoiceAssistant,
+                PiperTTSClient,
+                KokoroTTSClient,
+                AudioManager,
+            )
+
+            AudioManager.return_value = MagicMock(name="AudioManagerInstance")
+            PiperTTSClient.return_value = MagicMock(name="PiperTTSClientInstance")
+            KokoroTTSClient.return_value = MagicMock(name="KokoroTTSClientInstance")
+
+            with caplog.at_level(logging.WARNING, logger="main"):
+                assistant = VoiceAssistant()
+
+            # Assert: cayó a Piper con warning
+            PiperTTSClient.assert_called_once()
+            KokoroTTSClient.assert_not_called()
+            assert assistant._local_tts is PiperTTSClient.return_value
+            # El warning debe mencionar el engine inválido y el fallback
+            assert any(
+                "tts_engine" in r.getMessage().lower()
+                and "inv" in r.getMessage().lower()
+                and "piper" in r.getMessage().lower()
+                for r in caplog.records
+            ), (
+                f"Warning de tts_engine inválido no encontrado. "
+                f"Logs: {[r.getMessage() for r in caplog.records]}"
+            )
+
+    def test_tts_kokoro_primary_no_cloud_called(self, patched_assistant):
+        """Kokoro (representado por ``_local_tts`` mockeado) OK → Gemini y Azure NO se invocan.
+        Se reproduce con ``play_audio``.
+        """
+        # Arrange
+        _wire_successful_agent(patched_assistant)
+        pcm = b"\x00" * 48000
+        patched_assistant._local_tts.synthesize.return_value = pcm
+
+        # Act
+        patched_assistant.run_pipeline("/tmp/fake.wav")
+
+        # Assert
+        patched_assistant._local_tts.synthesize.assert_called_once()
+        # Texto limpio (sin prefijo [STYLE:]) va al TTS local
+        local_args = patched_assistant._local_tts.synthesize.call_args
+        assert local_args.args[0] == "Listo, abrí Chrome"
+        # Gemini y Azure NO se invocan
+        patched_assistant._gemini_tts.synthesize.assert_not_called()
+        patched_assistant._azure_tts.synthesize_stream.assert_not_called()
+        # Se reproduce por play_audio (no streaming)
+        patched_assistant._audio.play_audio.assert_called_once_with(pcm)
+        patched_assistant._audio.play_audio_stream.assert_not_called()
+        # Estado final IDLE
+        assert patched_assistant._state == patched_assistant.STATE_IDLE
+
+    def test_tts_kokoro_fails_gemini_fallback(self, patched_assistant):
+        """``_local_tts`` (Kokoro) falla → Gemini TTS OK → no se invoca Azure."""
+        # Arrange
+        _wire_successful_agent(patched_assistant)
+        patched_assistant._local_tts.synthesize.side_effect = RuntimeError(
+            "Kokoro falló"
+        )
+        pcm = b"\x00" * 48000
+        patched_assistant._gemini_tts.synthesize.return_value = pcm
+        patched_assistant._gemini_tts.is_available.return_value = True
+
+        # Act
+        patched_assistant.run_pipeline("/tmp/fake.wav")
+
+        # Assert
+        patched_assistant._local_tts.synthesize.assert_called_once()
+        patched_assistant._gemini_tts.is_available.assert_called_once()
+        patched_assistant._gemini_tts.synthesize.assert_called_once()
+        # Texto limpio va a Gemini
+        gemini_args = patched_assistant._gemini_tts.synthesize.call_args
+        assert gemini_args.args[0] == "Listo, abrí Chrome"
+        # Azure NO se invoca
+        patched_assistant._azure_tts.synthesize_stream.assert_not_called()
+        # Se reproduce por play_audio
+        patched_assistant._audio.play_audio.assert_called_once_with(pcm)
+        patched_assistant._audio.play_audio_stream.assert_not_called()
+        # Estado final IDLE
+        assert patched_assistant._state == patched_assistant.STATE_IDLE
+
+    def test_tts_kokoro_gemini_fail_azure_streaming(self, patched_assistant):
+        """``_local_tts`` (Kokoro) y Gemini fallan → Azure streaming se invoca con
+        ``play_audio_stream``.
+        """
+        # Arrange
+        _wire_successful_agent(patched_assistant)
+        patched_assistant._local_tts.synthesize.side_effect = RuntimeError(
+            "Kokoro falló"
+        )
+        patched_assistant._gemini_tts.synthesize.side_effect = RuntimeError(
+            "Gemini TTS falló"
+        )
+        patched_assistant._gemini_tts.is_available.return_value = True
+        # Azure streaming: retorna iterator de chunks PCM
+        fake_pcm_chunks = [b"\x00\x01" * 100, b"\x00\x01" * 100]
+        patched_assistant._azure_tts.synthesize_stream.return_value = iter(
+            fake_pcm_chunks
+        )
+
+        # Act
+        patched_assistant.run_pipeline("/tmp/fake.wav")
+
+        # Assert
+        patched_assistant._local_tts.synthesize.assert_called_once()
+        patched_assistant._gemini_tts.is_available.assert_called_once()
+        patched_assistant._gemini_tts.synthesize.assert_called_once()
+        patched_assistant._azure_tts.synthesize_stream.assert_called_once()
+        azure_args = patched_assistant._azure_tts.synthesize_stream.call_args
+        assert azure_args.args[0] == "Listo, abrí Chrome"
+        # Se pasa el iterator de Azure a play_audio_stream
+        patched_assistant._audio.play_audio_stream.assert_called_once()
+        # play_audio NO se llama (Azure streaming ya reprodujo)
+        patched_assistant._audio.play_audio.assert_not_called()
+        # Estado final IDLE
+        assert patched_assistant._state == patched_assistant.STATE_IDLE
