@@ -4,3 +4,6 @@ sounddevice==0.4.7
 numpy==1.26.4
 google-genai==0.3.0
 python-dotenv==1.0.1
+faster-whisper==1.2.1
+piper-tts==1.4.2
+onnxruntime==1.27.0

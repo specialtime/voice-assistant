@@ -24,6 +24,8 @@ from handlers.gemini_tts_client import GeminiTTSClient
 from handlers.azure_tts_client import AzureTTSClient
 from handlers.response_parser import parse_response
 from handlers.overlay import OverlayChip
+from handlers.whisper_stt_client import WhisperSTTClient
+from handlers.piper_tts_client import PiperTTSClient
 
 logger = logging.getLogger(__name__)
 
@@ -65,22 +67,29 @@ class VoiceAssistant:
         self._send_lock = threading.Lock()  # anti-concurrencia HTTP en send_command
         self._audio = AudioManager(self._settings)
 
-        # Clientes STT, OpenCode y TTS
+        # Clientes STT (local primario + cloud fallback)
         gemini_key = os.getenv("GEMINI_API_KEY")
         azure_key = os.getenv("AZURE_SPEECH_KEY")
         azure_region = os.getenv("AZURE_SPEECH_REGION", "southamericaeast")
         opencode_password = os.getenv("OPENCODE_SERVER_PASSWORD")
         opencode_base_url = os.getenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
 
+        # STT: Whisper local (primario), Gemini (fallback)
+        self._whisper_stt = WhisperSTTClient(self._settings)
         self._stt = GeminiSTTClient(self._settings, gemini_key) if gemini_key else None
-        self._opencode = OpenCodeClient(self._settings, opencode_password or "", opencode_base_url) if opencode_base_url else None
+
+        # TTS: Piper local (primario), Gemini (fallback 1), Azure (fallback 2)
+        self._piper_tts = PiperTTSClient(self._settings)
         self._gemini_tts = GeminiTTSClient(self._settings, gemini_key) if gemini_key else None
         self._azure_tts = AzureTTSClient(self._settings, azure_key, azure_region) if azure_key else None
 
+        # OpenCode (sin cambios)
+        self._opencode = OpenCodeClient(self._settings, opencode_password or "", opencode_base_url) if opencode_base_url else None
+
         if not gemini_key:
-            logger.warning("GEMINI_API_KEY no configurada — STT y Gemini TTS no disponibles")
+            logger.warning("GEMINI_API_KEY no configurada — Gemini STT/TTS fallback no disponible")
         if not azure_key:
-            logger.warning("AZURE_SPEECH_KEY no configurada — Azure TTS no disponible")
+            logger.warning("AZURE_SPEECH_KEY no configurada — Azure TTS fallback no disponible")
         if not opencode_base_url:
             logger.warning("OPENCODE_BASE_URL no configurada — agente no disponible")
 
@@ -174,15 +183,26 @@ class VoiceAssistant:
         """
         generation = self._pipeline_generation  # capturar al inicio
         try:
-            # 1. STT
+            # 1. STT — Whisper local (primario) → Gemini (fallback)
             if self._pipeline_generation != generation:
                 logger.info("Pipeline (gen=%d) cancelado antes de STT", generation)
                 return
-            if self._stt is None:
-                logger.error("STT no configurado (GEMINI_API_KEY faltante)")
+
+            text = None
+            try:
+                text = self._whisper_stt.transcribe(wav_path)
+                logger.debug("STT Whisper OK: %s", text[:100])
+            except Exception as e:
+                logger.warning("Whisper STT falló (%s), intentando Gemini fallback", e)
+                if self._stt is None:
+                    logger.error("Gemini STT no configurado (GEMINI_API_KEY faltante)")
+                    return
+                text = self._stt.transcribe(wav_path)
+                logger.debug("STT Gemini fallback OK: %s", text[:100])
+
+            if not text:
+                logger.error("STT retornó texto vacío")
                 return
-            text = self._stt.transcribe(wav_path)
-            logger.debug("STT resultado: %s", text[:100])
 
             # 2. Agente (cerebro) — con send_lock anti-concurrencia
             if self._pipeline_generation != generation:
@@ -216,26 +236,31 @@ class VoiceAssistant:
                 self._overlay.set_state("speaking")
                 logger.info("→ SPEAKING (gen=%d)", generation)
 
-            # 5 + 6. TTS con fallback Gemini → Azure
+            # 5 + 6. TTS — Piper local (primario) → Gemini (fallback 1) → Azure streaming (fallback 2)
             pcm_bytes = None
             try:
-                if self._gemini_tts is None:
-                    raise RuntimeError("Gemini TTS no configurado")
-                if not self._gemini_tts.is_available():
-                    raise RuntimeError("Gemini TTS circuit breaker abierto")
-                pcm_bytes = self._gemini_tts.synthesize(clean_text, style_hint)
-                logger.debug("TTS Gemini OK — %d bytes", len(pcm_bytes))
+                pcm_bytes = self._piper_tts.synthesize(clean_text, style_hint)
+                logger.debug("TTS Piper OK — %d bytes", len(pcm_bytes))
             except Exception as e:
-                logger.warning("Gemini TTS falló (%s), intentando Azure fallback", e)
-                if self._azure_tts is None:
-                    logger.error("Azure TTS no configurado (AZURE_SPEECH_KEY faltante)")
-                    return
-                # Streaming Azure: reproducir en tiempo real (latencia baja al primer sample)
-                self._audio.play_audio_stream(self._azure_tts.synthesize_stream(clean_text, style_hint))
-                logger.debug("TTS Azure streaming OK")
-                # pcm_bytes se queda en None → paso 7 se salta (ya reproducido)
+                logger.warning("Piper TTS falló (%s), intentando Gemini fallback", e)
+                try:
+                    if self._gemini_tts is None:
+                        raise RuntimeError("Gemini TTS no configurado")
+                    if not self._gemini_tts.is_available():
+                        raise RuntimeError("Gemini TTS circuit breaker abierto")
+                    pcm_bytes = self._gemini_tts.synthesize(clean_text, style_hint)
+                    logger.debug("TTS Gemini fallback OK — %d bytes", len(pcm_bytes))
+                except Exception as e2:
+                    logger.warning("Gemini TTS falló (%s), intentando Azure streaming fallback", e2)
+                    if self._azure_tts is None:
+                        logger.error("Azure TTS no configurado (AZURE_SPEECH_KEY faltante)")
+                        return
+                    # Streaming Azure: reproducir en tiempo real (latencia baja al primer sample)
+                    self._audio.play_audio_stream(self._azure_tts.synthesize_stream(clean_text, style_hint))
+                    logger.debug("TTS Azure streaming OK")
+                    # pcm_bytes se queda en None → paso 7 se salta (ya reproducido)
 
-            # 7. Playback (Gemini TTS — no streaming)
+            # 7. Playback (Piper o Gemini — no streaming)
             if pcm_bytes:
                 self._audio.play_audio(pcm_bytes)
                 logger.debug("Playback completado")

@@ -18,6 +18,20 @@
     "locale": "es-MX",
     "output_format": "raw-24khz-16bit-mono-pcm"
   },
+  "local": {
+    "whisper": {
+      "model": "small",
+      "device": "cuda",
+      "compute_type": "int8",
+      "language": "es",
+      "beam_size": 5
+    },
+    "piper": {
+      "voice_model": "es_AR-daniela-high",
+      "voices_dir": "models/piper-voices",
+      "length_scale": 1.0
+    }
+  },
   "audio": {
     "sample_rate": 24000,
     "channels": 1,
