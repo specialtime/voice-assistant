@@ -76,6 +76,54 @@ class KokoroTTSClient:
         self._kokoro = Kokoro(str(model_path), str(voices_path))
         logger.info("Modelo Kokoro cargado OK")
 
+    def _split_text(self, text: str) -> list[str]:
+        """Splitea texto en chunks seguros para Kokoro (<510 phonemas por batch).
+
+        kokoro-onnx 0.5.0 tiene MAX_PHONEME_LENGTH=510. Cuando el texto
+        genera >510 phonemas, `_split_phonemes` upstream solo splitea en
+        `[.,!?;]` — no splitea en `:`, `—`, `–`, `/`. Un batch excede 510
+        → trima → `voice[510]` out of bounds → IndexError.
+
+        Estrategia:
+        1. Colapsar whitespace (mismo paso que en synthesize()).
+        2. Split por puntuación fuerte + separadores (lookbehind): preserva
+           el signo en el chunk anterior. Incluye em-dash, en-dash, slash
+           y dos puntos (útiles para horarios `12:30`, rangos `lunes—martes`,
+           separadores `14/15`).
+        3. Safety net: chunks muy largos → split por espacios para evitar
+           un único chunk que aún supere el límite.
+
+        Args:
+            text: Texto crudo a sintetizar.
+
+        Returns:
+            Lista de chunks no vacíos, cada uno seguro para una llamada
+            a `Kokoro.create()` sin superar 510 phonemas.
+        """
+        normalized = re.sub(r"\s+", " ", text).strip()
+        # Split después de puntuación fuerte + separadores (em-dash, en-dash, slash, dos puntos)
+        chunks = re.split(r"(?<=[.,;:!?—–/])\s+", normalized)
+        chunks = [c.strip() for c in chunks if c.strip()]
+        # Safety net: chunks muy largos → split por espacios
+        # Heurística: ~3-4 chars por phonema → 1500 chars ≈ <510 phonemas.
+        MAX_CHARS = 1500
+        safe_chunks: list[str] = []
+        for c in chunks:
+            if len(c) > MAX_CHARS:
+                words = c.split(" ")
+                current = ""
+                for w in words:
+                    if current and len(current) + len(w) + 1 > MAX_CHARS:
+                        safe_chunks.append(current.strip())
+                        current = w
+                    else:
+                        current = (current + " " + w).strip() if current else w
+                if current:
+                    safe_chunks.append(current.strip())
+            else:
+                safe_chunks.append(c)
+        return safe_chunks
+
     def synthesize(self, text: str, style_hint: str = "") -> bytes:
         """Sintetiza texto a voz usando Kokoro local.
 
@@ -99,20 +147,32 @@ class KokoroTTSClient:
         # Colapsar cualquier secuencia de whitespace (newlines, tabs, espacios múltiples) a un solo espacio.
         # Previene el WARNING "words count mismatch" de phonemizer y artefactos de audio
         # (kokoro-onnx 0.5.0 no normaliza newlines internos — ver PR upstream #185).
-        text_normalized = re.sub(r"\s+", " ", text).strip()
+        # Además, spliteamos el texto en chunks seguros (<510 phonemas cada uno) para evitar
+        # el IndexError upstream cuando un batch excede MAX_PHONEME_LENGTH (ver issue #184).
+        chunks = self._split_text(text)
+        logger.debug("Kokoro TTS — %d chunks tras split", len(chunks))
+        first_chunk = chunks[0] if chunks else ""
         logger.debug(
-            "Kokoro TTS — texto normalizado='%s'",
-            text_normalized[:120] + ("..." if len(text_normalized) > 120 else ""),
+            "Kokoro TTS — texto normalizado (chunk 1)='%s'",
+            first_chunk[:120] + ("..." if len(first_chunk) > 120 else ""),
         )
 
         try:
-            samples, sample_rate = self._kokoro.create(
-                text_normalized,
-                voice=cfg["voice"],
-                speed=cfg["speed"],
-                lang=cfg["lang"],
-                trim=False,  # evitar corte agresivo de la última sílaba
-            )
+            audio_parts: list[np.ndarray] = []
+            for i, chunk in enumerate(chunks):
+                samples_part, _ = self._kokoro.create(
+                    chunk,
+                    voice=cfg["voice"],
+                    speed=cfg["speed"],
+                    lang=cfg["lang"],
+                    trim=False,  # evitar corte agresivo de la última sílaba
+                )
+                audio_parts.append(samples_part)
+                logger.debug(
+                    "Kokoro TTS — chunk %d/%d sintetizado (%d samples)",
+                    i + 1, len(chunks), len(samples_part),
+                )
+            samples = np.concatenate(audio_parts)
         except Exception as exc:
             logger.error("Kokoro TTS falló — %s: %s", type(exc).__name__, exc)
             raise RuntimeError(f"Kokoro TTS falló: {exc}") from exc
