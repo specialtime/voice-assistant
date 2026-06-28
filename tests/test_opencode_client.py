@@ -792,6 +792,174 @@ class TestOpenCodeClient:
         assert deltas == ["hola v2"]
         assert done is False
 
+    # ──────────────────────────────────────────────────────────────────
+    # Micro-Spec fix/sse-delta-event-type-mismatch: evento ``message.part.delta``
+    # ──────────────────────────────────────────────────────────────────
+    #
+    # El server opencode (>= versiones recientes) emite los deltas de texto con
+    # el tipo ``message.part.delta`` en lugar de ``session.next.text.delta``.
+    # Payload real observado (ver issue vibe-kanban #3123):
+    #
+    #   {
+    #     "type": "message.part.delta",
+    #     "properties": {
+    #       "sessionID": "ses_...",
+    #       "messageID": "msg_...",
+    #       "partID":    "prt_...",
+    #       "field":     "text",
+    #       "delta":     "fragmento de texto"
+    #     }
+    #   }
+    #
+    # El delta está en ``properties.delta`` (top-level), NO en
+    # ``properties.field.text`` (el ``field`` es un string con el nombre del
+    # campo modificado, no un dict). Bug observado en prod: el handler solo
+    # procesaba ``session.next.text.delta`` → delta_count == 0 → el
+    # ``session.idle`` final caía en la regla anti-stale y se descartaba,
+    # dejando el stream colgado hasta ``ReadError 10054``.
+
+    def test_process_sse_event_message_part_delta_v1(self):
+        """``message.part.delta`` con delta en ``properties.delta`` → extrae delta.
+
+        Caso real de producción (ses_0f00a1803ffeIc2f6gfmWsRsMv, 17:40:09):
+        el server emite ``message.part.delta`` con ``properties.delta`` como
+        top-level. El parser DEBE retornar el delta para que ``delta_count``
+        se incremente y el ``session.idle`` final no sea descartado por la
+        regla anti-stale.
+        """
+        client = OpenCodeClient.__new__(OpenCodeClient)
+        client.settings = {}
+
+        event_json = (
+            '{"type":"message.part.delta",'
+            '"properties":{'
+            '"sessionID":"ses_prod",'
+            '"messageID":"msg_abc",'
+            '"partID":"prt_xyz",'
+            '"field":"text",'
+            '"delta":"Hola desde prod"'
+            '}}'
+        )
+        deltas, done = client._process_sse_event(
+            event_json, "ses_prod", delta_count=0
+        )
+
+        assert deltas == ["Hola desde prod"]
+        assert done is False
+
+    def test_process_sse_event_message_part_delta_v2(self):
+        """``message.part.delta`` con delta en ``data.delta`` (formato v2).
+
+        Variante v2 del payload: todo el contenido bajo ``data.*`` en lugar de
+        ``properties.*``. El handler también acepta este formato.
+        """
+        client = OpenCodeClient.__new__(OpenCodeClient)
+        client.settings = {}
+
+        event_json = (
+            '{"type":"message.part.delta",'
+            '"data":{'
+            '"sessionID":"ses_v2d",'
+            '"messageID":"msg_abc",'
+            '"partID":"prt_xyz",'
+            '"field":"text",'
+            '"delta":"fragmento v2"'
+            '}}'
+        )
+        deltas, done = client._process_sse_event(
+            event_json, "ses_v2d", delta_count=0
+        )
+
+        assert deltas == ["fragmento v2"]
+        assert done is False
+
+    def test_process_sse_event_message_part_delta_enables_idle_close(self):
+        """``session.idle`` posterior a ``message.part.delta`` cierra el stream.
+
+        Regresión objetivo del bug de prod: si los deltas vienen como
+        ``message.part.delta`` y se procesan correctamente, ``delta_count``
+        pasa de 0 a N, y el ``session.idle`` subsiguiente ya NO se descarta
+        por la regla anti-stale (``delta_count > 0``) → cierra limpio.
+        """
+        client = OpenCodeClient.__new__(OpenCodeClient)
+        client.settings = {}
+
+        # 1) delta como ``message.part.delta``
+        delta_event = (
+            '{"type":"message.part.delta",'
+            '"properties":{"sessionID":"ses_bug","delta":"x"}}'
+        )
+        deltas, done = client._process_sse_event(
+            delta_event, "ses_bug", delta_count=0
+        )
+        assert deltas == ["x"]
+        assert done is False
+
+        # 2) ``session.idle`` con delta_count=1 (post-delta) → done=True
+        idle_event = (
+            '{"type":"session.idle","properties":{"sessionID":"ses_bug"}}'
+        )
+        deltas, done = client._process_sse_event(
+            idle_event, "ses_bug", delta_count=1
+        )
+        assert deltas == []
+        assert done is True
+
+    @patch("handlers.opencode_client.httpx.Client")
+    def test_send_command_stream_message_part_delta(self, mock_client_cls, mock_settings):
+        """E2E stream: deltas como ``message.part.delta`` cierran limpio en
+        ``session.idle`` y ``delta_count`` queda en N>0.
+
+        Regresión del bug de prod (17:40:09): el server emite 24 deltas como
+        ``message.part.delta``, luego un ``session.idle``. Antes del fix,
+        delta_count==0 al recibir el ``session.idle`` → WARNING + descartar
+        → el stream seguía leyendo heartbeats hasta ``ReadError 10054``
+        (~30s después) → ``RuntimeError("Error en stream SSE")`` propagado
+        → overlay colgado.
+
+        Con el fix: cada ``message.part.delta`` incrementa delta_count, el
+        ``session.idle`` llega con delta_count>0 y cierra el stream limpio,
+        yield-eando los deltas al consumidor.
+        """
+        mock_client = mock_client_cls.return_value
+        mock_client.post.side_effect = [
+            _ok_response({"id": "ses_mpd"}),
+            self._ok_post(204),
+        ]
+
+        # Reproducimos la secuencia real de prod: server.connected + 3 deltas
+        # ``message.part.delta`` + session.idle. Los deltas usan el formato
+        # v1 (properties.delta) que es el observado en el log.
+        sse_lines = [
+            b'data: {"id":"c","type":"server.connected","properties":{}}',
+            b'',
+            b'data: {"id":"d1","type":"message.part.delta",'
+            b'"properties":{"sessionID":"ses_mpd","delta":"Hola"}}',
+            b'',
+            b'data: {"id":"d2","type":"message.part.delta",'
+            b'"properties":{"sessionID":"ses_mpd","delta":" desde"}}',
+            b'',
+            b'data: {"id":"d3","type":"message.part.delta",'
+            b'"properties":{"sessionID":"ses_mpd","delta":" prod"}}',
+            b'',
+            b'data: {"id":"d4","type":"session.idle",'
+            b'"properties":{"sessionID":"ses_mpd"}}',
+            b'',
+        ]
+        mock_client.stream.return_value = self._make_sse_stream(sse_lines)
+
+        client = OpenCodeClient(mock_settings, "fake_pass", _BASE_URL)
+        deltas = list(client.send_command_stream("hola"))
+
+        # Yield de los 3 deltas en orden. Antes del fix esto era [] porque
+        # delta_count se quedaba en 0 y el session.idle se descartaba.
+        assert deltas == ["Hola", " desde", " prod"], (
+            f"Esperaba 3 deltas emitidos, obtuve {deltas}. "
+            "Si la lista está vacía, el bug de tipo de evento sigue activo."
+        )
+        # El _message_count se incrementó al cerrar el stream limpio.
+        assert client._message_count == 1
+
     @patch("handlers.opencode_client.httpx.Client")
     def test_send_command_stream_subscribes_before_prompt(
         self, mock_client_cls, mock_settings
