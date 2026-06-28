@@ -51,7 +51,8 @@
     "sample_rate": 24000,
     "channels": 1,
     "sample_width": 2,
-    "recording_filename": "comando.wav"
+    "recording_filename": "comando.wav",
+    "streaming_playback_safety_net_seconds": 600
   },
   "hotkey": "alt+v",
   "logging": {
