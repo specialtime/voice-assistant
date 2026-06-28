@@ -1,5 +1,5 @@
 @echo off
-cd /d "%~dp0"
+cd /d "%~dp0\.."
 
 :: Detectar pythonw.exe
 where pythonw.exe >nul 2>&1

@@ -4,7 +4,7 @@
 
 $ErrorActionPreference = "Stop"
 
-$DEV_DIR = $PSScriptRoot
+$DEV_DIR = Split-Path -Parent $PSScriptRoot
 $PROD_DIR = if ($env:CORTEX_PROD_DIR) { $env:CORTEX_PROD_DIR } else { "C:\Users\crist\voice-assistant" }
 
 Write-Host "[INFO] Deploy dev → prod"
@@ -31,8 +31,7 @@ if (-not (Test-Path -LiteralPath "$DEV_DIR\src")) {
 $toCopy = @(
     "src",
     "requirements.txt",
-    "start_cortex.bat",
-    "start_opencode_hidden.py"
+    "scripts"
 )
 
 foreach ($item in $toCopy) {
