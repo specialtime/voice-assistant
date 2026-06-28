@@ -204,3 +204,23 @@ class KokoroTTSClient:
         chunk_size = 4096
         for i in range(0, len(pcm_bytes), chunk_size):
             yield pcm_bytes[i:i + chunk_size]
+
+    def synthesize_sentence_stream(self, sentences: Iterator[str]) -> Iterator[bytes]:
+        """Sintetiza oraciones una a una y hace yield de PCM completo por oración.
+
+        Diferencia con synthesize_stream: recibe un Iterator[str] de oraciones
+        (no un texto completo) y sintetiza cada oración independientemente,
+        haciendo yield del PCM completo de cada una. Esto permite que el
+        playback empiece antes de que terminen de llegar todas las oraciones.
+
+        Args:
+            sentences: Iterator que yields oraciones (str) una a una.
+
+        Yields:
+            Bytes PCM crudo s16le (sin cabecera WAV) — un yield por oración.
+        """
+        for sentence in sentences:
+            if not sentence.strip():
+                continue
+            pcm_bytes = self.synthesize(sentence, style_hint="")
+            yield pcm_bytes
