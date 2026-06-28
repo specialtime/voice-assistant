@@ -188,6 +188,8 @@ Para usar Kokoro en vez de Piper:
 
 > **Normalización de texto:** El handler de Kokoro colapsa cualquier secuencia de whitespace (newlines, tabs, espacios múltiples) a un solo espacio antes de sintetizar, y deshabilita el `trim` de silencios finales de kokoro-onnx. Esto previene el WARNING `phonemizer: words count mismatch` cuando el agente devuelve texto multilinea (ej. listas con saltos de línea) y evita que el audio se corte abruptamente al final. Ver `specs/bug_kokoro_phonemizer_mismatch.md`.
 
+> **Chunking de textos largos:** `kokoro-onnx` 0.5.0 tiene un límite de 510 phonemas por batch y su `_split_phonemes` interno solo splitea en `[.,!?;]` (no en `:`, `—`, `/`), lo que causa `IndexError: index 510 is out of bounds` con textos largos (ej. agenda semanal). El handler splitea el texto por puntuación fuerte (`.,;:!?—–/`) antes de llamar a `create()`, con un safety net de 1500 chars para chunks sin puntuación, y concatena el audio resultante. Ver `specs/bug_kokoro_chunking_510_phonemes.md`.
+
 ### 5. Levantar el servidor OpenCode
 
 ```powershell
