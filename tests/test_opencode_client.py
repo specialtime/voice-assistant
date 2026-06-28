@@ -576,24 +576,44 @@ class TestOpenCodeClient:
 
     @patch("handlers.opencode_client.httpx.Client")
     def test_send_command_stream_prompt_async_fails(self, mock_client_cls, mock_settings):
-        """``prompt_async`` con HTTP 500 → ``RuntimeError`` SIN consumir el SSE.
+        """``prompt_async`` con HTTP 500 → ``RuntimeError`` DESPUÉS de abrir el SSE.
 
-        El handler debe fallar ANTES de tocar el stream — el caller hace fallback
-        síncrono. Por lo tanto, ``client.stream`` NO debe haberse llamado.
+        Tras el fix de la micro-spec ``fix/streaming-sse-zero-deltas``, el handler
+        SUSCRIBE al stream ``GET /event`` ANTES de enviar ``prompt_async`` para
+        cerrar la race window. Por lo tanto:
+
+        - El SSE SÍ se abre (el stream ya estaba listo cuando llega el fallo).
+        - El primer evento del stream (típicamente ``server.connected``) debe
+          haberse consumido para confirmar la suscripción activa.
+        - El ``prompt_async`` posterior falla con 500 → ``RuntimeError``.
+        - El ``with`` cierra el stream al propagar la excepción.
         """
         mock_client = mock_client_cls.return_value
+        # ensure_session OK → prompt_async 500
         mock_client.post.side_effect = [
             _ok_response({"id": "ses_x"}),
             _err_response(500, "internal error"),
         ]
+
+        # El stream entrega al menos un primer evento válido (server.connected
+        # de una sesión arbitraria — el handler acepta cualquier primer evento
+        # para confirmar la suscripción). Tras eso el iterador se agota y el
+        # código sigue a ``prompt_async`` que falla con 500.
+        sse_lines = [
+            b'data: {"id":"evt_conn","type":"server.connected","properties":{}}',
+            b'',
+        ]
+        mock_client.stream.return_value = self._make_sse_stream(sse_lines)
 
         client = OpenCodeClient(mock_settings, "fake_pass", _BASE_URL)
 
         with pytest.raises(RuntimeError, match=r"prompt_async"):
             list(client.send_command_stream("hola"))
 
-        # El SSE NO se abrió
-        assert mock_client.stream.call_count == 0
+        # El SSE SÍ se abrió (subscribe antes de prompt_async)
+        assert mock_client.stream.call_count == 1
+        # ensure_session + prompt_async (fallido) = 2 POSTs
+        assert mock_client.post.call_count == 2
 
     @patch("handlers.opencode_client.httpx.Client")
     def test_send_command_stream_increments_message_count(self, mock_client_cls, mock_settings):
@@ -707,3 +727,130 @@ class TestOpenCodeClient:
         assert deltas == ["b"]
         assert client.session_id == "sess_after_compact"
         assert client._message_count == 1
+
+    # ──────────────────────────────────────────────────────────────────
+    # Micro-Spec fix/streaming-sse-zero-deltas
+    # ──────────────────────────────────────────────────────────────────
+
+    def test_process_sse_event_anti_stale_idle_ignored(self):
+        """``session.idle`` con ``delta_count == 0`` se IGNORA (no cierra stream).
+
+        Regla anti-stale: si llega un ``session.idle`` antes que cualquier delta,
+        se interpreta como un evento huérfano de un prompt previo cuya sesión
+        coincidió por casualidad. El handler loguea WARNING y retorna
+        ``([], False)`` — el consumidor sigue leyendo el stream.
+
+        Verifica directamente el helper ``_process_sse_event`` con la nueva firma
+        de 3 argumentos.
+        """
+        client = OpenCodeClient.__new__(OpenCodeClient)  # bypass __init__
+        client.settings = {}
+
+        event_json = (
+            '{"type":"session.idle","properties":{"sessionID":"ses_x"}}'
+        )
+        deltas, done = client._process_sse_event(event_json, "ses_x", delta_count=0)
+
+        # NO cierra el stream
+        assert deltas == []
+        assert done is False
+
+    def test_process_sse_event_idle_after_delta_closes(self):
+        """``session.idle`` con ``delta_count > 0`` cierra el stream.
+
+        Caso opuesto: ya recibimos al menos un delta en este stream, por lo
+        tanto el ``session.idle`` es válido y debe señalizar ``done=True``
+        para que el handler haga ``break`` del loop de ``iter_lines``.
+        """
+        client = OpenCodeClient.__new__(OpenCodeClient)
+        client.settings = {}
+
+        event_json = (
+            '{"type":"session.idle","properties":{"sessionID":"ses_x"}}'
+        )
+        deltas, done = client._process_sse_event(event_json, "ses_x", delta_count=3)
+
+        assert deltas == []
+        assert done is True
+
+    def test_process_sse_event_v2_format(self):
+        """Formato v2: delta en ``data.sessionID`` y ``data.field.text``.
+
+        El server opencode puede emitir el evento con el campo ``data.*`` en
+        lugar de ``properties.*``. El parser debe aceptar ambos formatos y
+        extraer el delta correctamente.
+        """
+        client = OpenCodeClient.__new__(OpenCodeClient)
+        client.settings = {}
+
+        event_json = (
+            '{"type":"session.next.text.delta",'
+            '"data":{"sessionID":"ses_v2","field":{"text":"hola v2"}}}'
+        )
+        deltas, done = client._process_sse_event(event_json, "ses_v2", delta_count=0)
+
+        assert deltas == ["hola v2"]
+        assert done is False
+
+    @patch("handlers.opencode_client.httpx.Client")
+    def test_send_command_stream_subscribes_before_prompt(
+        self, mock_client_cls, mock_settings
+    ):
+        """El stream ``GET /event`` se abre ANTES del ``POST .../prompt_async``.
+
+        El fix invierte el orden para cerrar la race window entre el POST del
+        prompt y el primer delta del SSE. Verificamos el orden en
+        ``mock_client.method_calls`` para detectar regresiones si alguien
+        revierte el orden en el futuro.
+        """
+        mock_client = mock_client_cls.return_value
+        mock_client.post.side_effect = [
+            _ok_response({"id": "ses_order"}),  # ensure_session
+            self._ok_post(204),                 # prompt_async
+        ]
+
+        sse_lines = [
+            b'data: {"id":"c","type":"server.connected","properties":{}}',
+            b'',
+            b'data: {"id":"d1","type":"session.next.text.delta","properties":{"sessionID":"ses_order","delta":"x"}}',
+            b'',
+            b'data: {"id":"d2","type":"session.idle","properties":{"sessionID":"ses_order"}}',
+            b'',
+        ]
+        mock_client.stream.return_value = self._make_sse_stream(sse_lines)
+
+        client = OpenCodeClient(mock_settings, "fake_pass", _BASE_URL)
+        list(client.send_command_stream("orden"))
+
+        # Localizar el call al stream y al prompt_async dentro de method_calls
+        method_calls = mock_client.method_calls
+        stream_call_idx = next(
+            (
+                i
+                for i, call in enumerate(method_calls)
+                if call[0] == "stream"
+            ),
+            None,
+        )
+        prompt_async_idx = next(
+            (
+                i
+                for i, call in enumerate(method_calls)
+                if call[0] == "post"
+                and len(call[1]) >= 1
+                and call[1][0].endswith("/prompt_async")
+            ),
+            None,
+        )
+
+        assert stream_call_idx is not None, (
+            "No se encontró ninguna llamada a mock_client.stream"
+        )
+        assert prompt_async_idx is not None, (
+            "No se encontró ninguna llamada a mock_client.post(.../prompt_async)"
+        )
+        assert stream_call_idx < prompt_async_idx, (
+            f"Orden incorrecto: stream_call_idx={stream_call_idx}, "
+            f"prompt_async_idx={prompt_async_idx}. El stream DEBE abrirse "
+            f"ANTES que prompt_async para cerrar la race window."
+        )

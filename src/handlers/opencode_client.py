@@ -275,57 +275,117 @@ class OpenCodeClient:
 
         Flujo:
         1. ensure_session()
-        2. POST /session/:id/prompt_async con body {agent, parts: [{type:"text", text}]}
-           - Si falla con HTTP error → raise RuntimeError (el caller hace fallback síncrono)
-        3. GET /event con httpx.Client.stream("GET", "/event", ...) — SSE stream
-           - Usar la MISMA auth del cliente (self._client tiene auth configurada)
-           - Timeout de lectura: usar self._client.timeout (120s default)
-        4. Parsear eventos SSE:
-           - Formato: líneas `data: {json}\\n\\n`
-           - Acumular líneas hasta `\\n\\n` (evento completo)
-           - Decodificar JSON, leer campo `type` y `properties`
-        5. Filtrar: solo procesar eventos donde properties.sessionID == self.session_id
-        6. Yield properties.delta de eventos type=="session.next.text.delta"
-        7. Terminar (return) al recibir:
-           - type=="session.idle" con properties.sessionID == self.session_id
-           - type=="session.error" → raise RuntimeError(f"Agente error: {properties.error}")
-        8. Al terminar (session.idle): incrementar self._message_count y compactar si llega a max
+        2. **Abrir** GET /event con httpx.Client.stream("GET", "/event", ...) — SSE stream
+           - El handler del server registra el listener ANTES de retornar 200 (ver
+             event.ts en opencode: ``yield* events.all()``). Hay que suscribirse
+             ANTES de enviar ``prompt_async`` para no perder deltas emitidos entre
+             el POST y el GET (race condition documentada en micro-spec
+             fix/streaming-sse-zero-deltas).
+        3. **Esperar el primer evento del stream** (``server.connected``) para
+           confirmar que la suscripción está activa antes de enviar el prompt.
+           Si el stream falla antes de eso → raise (no leak, el ``with`` cierra).
+        4. POST /session/:id/prompt_async con body {agent, parts: [{type:"text", text}]}
+           - Si falla con HTTP error → cerrar el stream y raise RuntimeError.
+        5. Parsear el resto de eventos SSE (formato `data: {json}\\n\\n`).
+        6. Filtrar: solo procesar eventos donde sessionID (en ``properties`` o
+           ``data``) == self.session_id.
+        7. Yield ``delta`` (en ``properties.delta`` o ``data.field.text``) de
+           eventos type=="session.next.text.delta".
+        8. Terminar al recibir ``session.idle`` válido (ver regla anti-stale abajo).
+        9. Al terminar: incrementar ``_message_count`` y compactar si llega a max.
+
+        **Regla anti-stale de session.idle**: el stream ``/event`` es GLOBAL
+        (todas las sesiones del servidor pasan por el mismo endpoint) y LIVE-ONLY
+        (no replay histórico). Si el handler se suscribe tarde puede recibir un
+        ``session.idle`` residual de un prompt previo cuyo ``sessionID`` coincide
+        por casualidad con el actual. Para evitar cierres prematuros con 0
+        deltas, se exige: si llega ``session.idle`` y ``delta_count == 0``, se
+        IGNORA con WARNING y se sigue leyendo el stream.
 
         Yields:
             str: cada delta de texto del agente.
 
         Raises:
-            RuntimeError: si prompt_async falla o session.error.
+            RuntimeError: si el subscribe al stream falla, si prompt_async falla,
+                o si llega session.error.
         """
         session_id = self.ensure_session()
 
-        # --- Paso 2: POST prompt_async ---
+        # --- Paso 2-3: Suscribirse al stream ANTES de enviar prompt_async ---
+        streaming_timeout = self.settings.get("opencode", {}).get("streaming_timeout_seconds", 120)
+        start_time = time.monotonic()
+        delta_count = 0
+        first_delta_logged = False
+        stream_opened = False
+
         body = {
             "agent": self.settings["opencode"]["agent"],
             "parts": [{"type": "text", "text": text}],
         }
-        try:
-            response = self._client.post(
-                f"/session/{session_id}/prompt_async", json=body
-            )
-            response.raise_for_status()
-        except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.RequestError) as exc:
-            logger.error(
-                "prompt_async falló — %s: %s",
-                type(exc).__name__,
-                exc,
-            )
-            raise RuntimeError("prompt_async falló") from exc
 
-        # --- Paso 3-7: Leer stream SSE ---
-        delta_count = 0
-        first_delta_logged = False
-        streaming_timeout = self.settings.get("opencode", {}).get("streaming_timeout_seconds", 120)
-        start_time = time.monotonic()
         try:
             with self._client.stream("GET", "/event") as stream_response:
                 stream_response.raise_for_status()
+                stream_opened = True
                 data_buffer = ""
+
+                # Consumir el primer evento (server.connected) para confirmar
+                # que la suscripción está activa antes de enviar el prompt.
+                # Si no llega en un tiempo razonable, timeout del stream.
+                connected_seen = False
+                while not connected_seen:
+                    if time.monotonic() - start_time > streaming_timeout:
+                        logger.warning(
+                            "Stream SSE: timeout esperando server.connected tras %ds — cerrando",
+                            streaming_timeout,
+                        )
+                        raise RuntimeError("Stream SSE no se inicializó")
+
+                    line_bytes = next(stream_response.iter_lines(), None)
+                    if line_bytes is None:
+                        # Stream cerrado por el server sin server.connected
+                        logger.warning("Stream SSE cerrado por server antes de server.connected")
+                        raise RuntimeError("Stream SSE cerrado prematuramente")
+
+                    line = line_bytes.decode("utf-8") if isinstance(line_bytes, bytes) else line_bytes
+                    if line.startswith("data: "):
+                        data_buffer += line[6:]
+                    elif line == "" and data_buffer:
+                        # Primer evento: procesar (puede ser server.connected u otro)
+                        deltas, done = self._process_sse_event(
+                            data_buffer, session_id, delta_count
+                        )
+                        for delta in deltas:
+                            if not first_delta_logged:
+                                logger.debug("Primer delta recibido: %r", delta)
+                                first_delta_logged = True
+                            delta_count += 1
+                            yield delta
+                        # No debe haber session.idle aquí, pero por las dudas
+                        if done:
+                            logger.debug("session.idle recibido antes de prompt_async — cerrando")
+                            return  # sale del with → finally ejecuta compactación
+                        data_buffer = ""
+                        connected_seen = True  # cualquier primer evento válido
+
+                # --- Paso 4: POST prompt_async (suscripción ya activa) ---
+                try:
+                    response = self._client.post(
+                        f"/session/{session_id}/prompt_async", json=body
+                    )
+                    response.raise_for_status()
+                    logger.debug(
+                        "prompt_async enviado y stream /event ya suscrito — race window cerrado"
+                    )
+                except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.RequestError) as exc:
+                    logger.error(
+                        "prompt_async falló (post-subscribe) — %s: %s",
+                        type(exc).__name__,
+                        exc,
+                    )
+                    raise RuntimeError("prompt_async falló") from exc
+
+                # --- Paso 5-8: Leer el resto del stream ---
                 for line_bytes in stream_response.iter_lines():
                     line = line_bytes.decode("utf-8") if isinstance(line_bytes, bytes) else line_bytes
 
@@ -333,7 +393,7 @@ class OpenCodeClient:
                         # Línea vacía → fin de evento SSE
                         if data_buffer:
                             deltas, done = self._process_sse_event(
-                                data_buffer, session_id
+                                data_buffer, session_id, delta_count
                             )
                             for delta in deltas:
                                 if not first_delta_logged:
@@ -342,7 +402,10 @@ class OpenCodeClient:
                                 delta_count += 1
                                 yield delta
                             if done:
-                                logger.debug("session.idle recibido — cerrando stream SSE")
+                                logger.debug(
+                                    "session.idle válido recibido — cerrando stream SSE (%d deltas)",
+                                    delta_count,
+                                )
                                 break
                             data_buffer = ""
                         continue
@@ -354,14 +417,17 @@ class OpenCodeClient:
                     # Timeout absoluto del stream
                     if time.monotonic() - start_time > streaming_timeout:
                         logger.warning(
-                            "Stream SSE excedió timeout de %ds — cerrando",
+                            "Stream SSE excedió timeout de %ds — cerrando (%d deltas)",
                             streaming_timeout,
+                            delta_count,
                         )
                         break
 
                 # Fin del stream: procesar cualquier evento residual
                 if data_buffer:
-                    deltas, done = self._process_sse_event(data_buffer, session_id)
+                    deltas, done = self._process_sse_event(
+                        data_buffer, session_id, delta_count
+                    )
                     for delta in deltas:
                         if not first_delta_logged:
                             logger.debug("Primer delta recibido: %r", delta)
@@ -375,9 +441,14 @@ class OpenCodeClient:
                 type(exc).__name__,
                 exc,
             )
+            if stream_opened:
+                # El stream se abrió pero falló la lectura — no propagar
+                # RuntimeError adicional, el caller puede hacer fallback.
+                raise RuntimeError("Error en stream SSE") from exc
+            # El stream ni siquiera se pudo abrir → propagar para fallback síncrono.
             raise RuntimeError("Error en stream SSE") from exc
 
-        # --- Paso 8: Compactación ---
+        # --- Paso 9: Compactación ---
         self._message_count += 1
         if self._message_count >= self._max_messages:
             logger.info(
@@ -392,17 +463,25 @@ class OpenCodeClient:
             delta_count,
         )
 
-    def _process_sse_event(self, data_str: str, session_id: str) -> Tuple[List[str], bool]:
+    def _process_sse_event(
+        self, data_str: str, session_id: str, delta_count: int
+    ) -> Tuple[List[str], bool]:
         """Procesa un evento SSE completo: parsea JSON, filtra por sessionID,
         y retorna tupla (deltas, done) o lanza error según el tipo de evento.
+
+        Tolerante a dos formatos de payload (v1 ``properties.*`` y v2 ``data.*``).
+        Loguea a DEBUG el ``type`` y el sessionID resuelto de cada evento para
+        diagnóstico en producción.
 
         Args:
             data_str: String JSON del campo `data:` del evento SSE.
             session_id: ID de sesión esperado para filtrar eventos.
+            delta_count: Cantidad de deltas recibidos hasta ahora en este stream.
+                Se usa para descartar ``session.idle`` espurios (sin deltas).
 
         Returns:
             Tupla (deltas, done): deltas es lista de strings, done es True si
-            el evento señaliza fin del stream (session.idle).
+            el evento señaliza fin del stream (session.idle) y es válido.
 
         Raises:
             RuntimeError: si el evento es session.error.
@@ -415,21 +494,48 @@ class OpenCodeClient:
 
         event_type = event.get("type", "")
         properties = event.get("properties", {})
+        data_field = event.get("data", {})
 
-        # Filtrar por sessionID
-        if properties.get("sessionID") != session_id:
+        # Telemetría de diagnóstico: loguear type y sessionID de CADA evento
+        # antes de cualquier filtro, para entender qué emite el server realmente.
+        resolved_session_id = (
+            properties.get("sessionID")
+            or data_field.get("sessionID")
+            or ""
+        )
+        logger.debug(
+            "SSE event received: type=%r, sessionID=%r (expected=%r)",
+            event_type,
+            resolved_session_id,
+            session_id,
+        )
+
+        # Filtrar por sessionID (acepta tanto properties.sessionID como data.sessionID)
+        if resolved_session_id != session_id:
             return [], False
 
         if event_type == "session.next.text.delta":
-            delta = properties.get("delta", "")
+            # Acepta delta en properties.delta (v1) o data.field.text (v2)
+            delta = properties.get("delta") or data_field.get("field", {}).get("text", "")
             if delta:
                 return [delta], False
             return [], False
         elif event_type == "session.idle":
-            # Fin normal del stream — señalizar terminación
+            # Regla anti-stale: ignorar session.idle si aún no llegó ningún delta.
+            # El server emite session.idle por sesión al cerrarse; si la suscripción
+            # se hace tarde o el stream arrastra eventos previos, podríamos recibir
+            # un session.idle "huérfano" antes que los deltas reales. Requerir al
+            # menos un delta garantiza que el cierre corresponde a ESTE prompt.
+            if delta_count == 0:
+                logger.warning(
+                    "session.idle recibido ANTES de cualquier delta — ignorando "
+                    "(probable evento stale de un prompt previo). sessionID=%s",
+                    session_id,
+                )
+                return [], False  # NO cerrar el stream, seguir leyendo
             return [], True
         elif event_type == "session.error":
-            error_msg = properties.get("error", "error desconocido")
+            error_msg = properties.get("error") or data_field.get("error") or "error desconocido"
             logger.error("Agente reportó error: %s", error_msg)
             raise RuntimeError(f"Agente error: {error_msg}")
 
