@@ -749,7 +749,10 @@ class TestOpenCodeClient:
         event_json = (
             '{"type":"session.idle","properties":{"sessionID":"ses_x"}}'
         )
-        deltas, done = client._process_sse_event(event_json, "ses_x", delta_count=0)
+        part_types: dict = {}
+        deltas, done = client._process_sse_event(
+            event_json, "ses_x", delta_count=0, part_types=part_types
+        )
 
         # NO cierra el stream
         assert deltas == []
@@ -768,7 +771,10 @@ class TestOpenCodeClient:
         event_json = (
             '{"type":"session.idle","properties":{"sessionID":"ses_x"}}'
         )
-        deltas, done = client._process_sse_event(event_json, "ses_x", delta_count=3)
+        part_types: dict = {}
+        deltas, done = client._process_sse_event(
+            event_json, "ses_x", delta_count=3, part_types=part_types
+        )
 
         assert deltas == []
         assert done is True
@@ -787,7 +793,10 @@ class TestOpenCodeClient:
             '{"type":"session.next.text.delta",'
             '"data":{"sessionID":"ses_v2","field":{"text":"hola v2"}}}'
         )
-        deltas, done = client._process_sse_event(event_json, "ses_v2", delta_count=0)
+        part_types: dict = {}
+        deltas, done = client._process_sse_event(
+            event_json, "ses_v2", delta_count=0, part_types=part_types
+        )
 
         assert deltas == ["hola v2"]
         assert done is False
@@ -840,8 +849,9 @@ class TestOpenCodeClient:
             '"delta":"Hola desde prod"'
             '}}'
         )
+        part_types: dict = {}
         deltas, done = client._process_sse_event(
-            event_json, "ses_prod", delta_count=0
+            event_json, "ses_prod", delta_count=0, part_types=part_types
         )
 
         assert deltas == ["Hola desde prod"]
@@ -866,8 +876,9 @@ class TestOpenCodeClient:
             '"delta":"fragmento v2"'
             '}}'
         )
+        part_types: dict = {}
         deltas, done = client._process_sse_event(
-            event_json, "ses_v2d", delta_count=0
+            event_json, "ses_v2d", delta_count=0, part_types=part_types
         )
 
         assert deltas == ["fragmento v2"]
@@ -889,8 +900,9 @@ class TestOpenCodeClient:
             '{"type":"message.part.delta",'
             '"properties":{"sessionID":"ses_bug","delta":"x"}}'
         )
+        part_types: dict = {}
         deltas, done = client._process_sse_event(
-            delta_event, "ses_bug", delta_count=0
+            delta_event, "ses_bug", delta_count=0, part_types=part_types
         )
         assert deltas == ["x"]
         assert done is False
@@ -900,7 +912,7 @@ class TestOpenCodeClient:
             '{"type":"session.idle","properties":{"sessionID":"ses_bug"}}'
         )
         deltas, done = client._process_sse_event(
-            idle_event, "ses_bug", delta_count=1
+            idle_event, "ses_bug", delta_count=1, part_types=part_types
         )
         assert deltas == []
         assert done is True
@@ -1238,3 +1250,338 @@ class TestOpenCodeClient:
             f"prompt_async debió invocarse 1 vez tras server.connected; "
             f"se invocó {len(prompt_async_calls)} veces."
         )
+
+    # ──────────────────────────────────────────────────────────────────
+    # Micro-Spec fix/tts-reasoning-leak: filtrado de deltas por part.type
+    # ──────────────────────────────────────────────────────────────────
+    #
+    # El server opencode emite deltas para CUALQUIER part (text, reasoning,
+    # tool, etc.) usando el mismo tipo de evento ``message.part.delta``.
+    # Para saber si un delta es respuesta al usuario o cadena de pensamiento,
+    # hay que haber registrado el ``partID -> part.type`` al recibir el
+    # ``message.part.updated`` previo. El fix agrega ese registro y filtra
+    # los deltas cuyo tipo está en ``_FILTERED_PART_TYPES`` (``reasoning``,
+    # ``tool``, ``file``, ``step-start``, ``step-finish``, ``compaction``,
+    # ``subtask``).
+
+    def test_part_updated_registers_text_type(self):
+        """``message.part.updated`` con ``part.type="text"`` registra el tipo.
+
+        El handler debe guardar ``partID -> part.type`` en ``part_types`` y
+        NO emitir delta (es un evento de metadata, no de contenido).
+        Retorna ``([], False)``.
+        """
+        client = OpenCodeClient.__new__(OpenCodeClient)
+        client.settings = {}
+
+        event_json = (
+            '{"type":"message.part.updated",'
+            '"properties":{'
+            '"sessionID":"ses_prt1",'
+            '"part":{"id":"prt_1","type":"text"}'
+            '}}'
+        )
+        part_types: dict = {}
+        deltas, done = client._process_sse_event(
+            event_json, "ses_prt1", delta_count=0, part_types=part_types
+        )
+
+        assert deltas == []
+        assert done is False
+        assert part_types == {"prt_1": "text"}, (
+            f"part_types mal registrado. Esperaba {{'prt_1': 'text'}}, "
+            f"obtuve {part_types}"
+        )
+
+    def test_part_updated_registers_reasoning_type(self):
+        """``message.part.updated`` con ``part.type="reasoning"`` se registra.
+
+        Variante con tipo ``reasoning`` (cadena de pensamiento) — el handler
+        debe registrar el tipo pero NO emitir delta.
+        """
+        client = OpenCodeClient.__new__(OpenCodeClient)
+        client.settings = {}
+
+        event_json = (
+            '{"type":"message.part.updated",'
+            '"properties":{'
+            '"sessionID":"ses_prt2",'
+            '"part":{"id":"prt_2","type":"reasoning"}'
+            '}}'
+        )
+        part_types: dict = {}
+        deltas, done = client._process_sse_event(
+            event_json, "ses_prt2", delta_count=0, part_types=part_types
+        )
+
+        assert deltas == []
+        assert done is False
+        assert part_types == {"prt_2": "reasoning"}, (
+            f"part_types mal registrado. Esperaba {{'prt_2': 'reasoning'}}, "
+            f"obtuve {part_types}"
+        )
+
+    def test_part_updated_v2_format(self):
+        """Formato v2: ``data.part`` en lugar de ``properties.part``.
+
+        El server opencode puede emitir ``message.part.updated`` con el
+        payload bajo ``data.*`` en lugar de ``properties.*``. El handler
+        debe aceptar ambos formatos.
+        """
+        client = OpenCodeClient.__new__(OpenCodeClient)
+        client.settings = {}
+
+        event_json = (
+            '{"type":"message.part.updated",'
+            '"data":{'
+            '"sessionID":"ses_prt3",'
+            '"part":{"id":"prt_3","type":"text"}'
+            '}}'
+        )
+        part_types: dict = {}
+        deltas, done = client._process_sse_event(
+            event_json, "ses_prt3", delta_count=0, part_types=part_types
+        )
+
+        assert deltas == []
+        assert done is False
+        assert part_types == {"prt_3": "text"}, (
+            f"Formato v2 no reconocido. Esperaba {{'prt_3': 'text'}}, "
+            f"obtuve {part_types}"
+        )
+
+    def test_delta_text_part_emitted(self):
+        """Delta de un part ``text`` registrado → se emite.
+
+        Tras registrar ``prt_x -> text``, un ``message.part.delta`` con
+        ``partID="prt_x"`` debe emitir el delta (es respuesta al usuario).
+        """
+        client = OpenCodeClient.__new__(OpenCodeClient)
+        client.settings = {}
+
+        # 1) Registrar el part como text
+        updated_event = (
+            '{"type":"message.part.updated",'
+            '"properties":{'
+            '"sessionID":"ses_emit",'
+            '"part":{"id":"prt_x","type":"text"}'
+            '}}'
+        )
+        part_types: dict = {}
+        client._process_sse_event(
+            updated_event, "ses_emit", delta_count=0, part_types=part_types
+        )
+
+        # 2) Delta del part text → debe emitirse
+        delta_event = (
+            '{"type":"message.part.delta",'
+            '"properties":{'
+            '"sessionID":"ses_emit",'
+            '"partID":"prt_x",'
+            '"delta":"hola"'
+            '}}'
+        )
+        deltas, done = client._process_sse_event(
+            delta_event, "ses_emit", delta_count=0, part_types=part_types
+        )
+
+        assert deltas == ["hola"], (
+            f"Delta de part text no emitido. Esperaba ['hola'], obtuve {deltas}"
+        )
+        assert done is False
+
+    def test_delta_reasoning_part_filtered(self):
+        """Delta de un part ``reasoning`` registrado → se descarta.
+
+        Tras registrar ``prt_x -> reasoning``, un ``message.part.delta`` con
+        ``partID="prt_x"`` debe DESCARTARSE (no es respuesta al usuario).
+        """
+        client = OpenCodeClient.__new__(OpenCodeClient)
+        client.settings = {}
+
+        # 1) Registrar el part como reasoning
+        updated_event = (
+            '{"type":"message.part.updated",'
+            '"properties":{'
+            '"sessionID":"ses_filt",'
+            '"part":{"id":"prt_x","type":"reasoning"}'
+            '}}'
+        )
+        part_types: dict = {}
+        client._process_sse_event(
+            updated_event, "ses_filt", delta_count=0, part_types=part_types
+        )
+        assert part_types == {"prt_x": "reasoning"}
+
+        # 2) Delta del part reasoning → debe descartarse
+        delta_event = (
+            '{"type":"message.part.delta",'
+            '"properties":{'
+            '"sessionID":"ses_filt",'
+            '"partID":"prt_x",'
+            '"delta":"The user is asking for their schedule."'
+            '}}'
+        )
+        deltas, done = client._process_sse_event(
+            delta_event, "ses_filt", delta_count=0, part_types=part_types
+        )
+
+        assert deltas == [], (
+            f"Delta de reasoning NO debió emitirse. Obtuve {deltas}. "
+            "El filtrado por part.type está roto."
+        )
+        assert done is False
+        # El registro en part_types persiste
+        assert part_types == {"prt_x": "reasoning"}
+
+    def test_delta_tool_part_filtered(self):
+        """Delta de un part ``tool`` registrado → se descarta.
+
+        El output de herramientas (bash, file ops) NO es respuesta al usuario.
+        Tras registrar ``prt_x -> tool``, el delta debe descartarse.
+        """
+        client = OpenCodeClient.__new__(OpenCodeClient)
+        client.settings = {}
+
+        # 1) Registrar el part como tool
+        updated_event = (
+            '{"type":"message.part.updated",'
+            '"properties":{'
+            '"sessionID":"ses_tool",'
+            '"part":{"id":"prt_x","type":"tool"}'
+            '}}'
+        )
+        part_types: dict = {}
+        client._process_sse_event(
+            updated_event, "ses_tool", delta_count=0, part_types=part_types
+        )
+
+        # 2) Delta del part tool → debe descartarse
+        delta_event = (
+            '{"type":"message.part.delta",'
+            '"properties":{'
+            '"sessionID":"ses_tool",'
+            '"partID":"prt_x",'
+            '"delta":"output de la herramienta"'
+            '}}'
+        )
+        deltas, done = client._process_sse_event(
+            delta_event, "ses_tool", delta_count=0, part_types=part_types
+        )
+
+        assert deltas == [], (
+            f"Delta de tool NO debió emitirse. Obtuve {deltas}."
+        )
+        assert done is False
+
+    def test_delta_unknown_partid_emitted_by_default(self):
+        """Delta con ``partID`` desconocido → se emite por defecto (compat).
+
+        Si el server no emite ``message.part.updated`` antes del delta, el
+        ``partID`` no estará en ``part_types``. Para no romper servers que
+        no emiten ``part.updated``, el handler emite el delta por defecto.
+        """
+        client = OpenCodeClient.__new__(OpenCodeClient)
+        client.settings = {}
+
+        # Sin part.updated previo: part_types vacío
+        delta_event = (
+            '{"type":"message.part.delta",'
+            '"properties":{'
+            '"sessionID":"ses_unk",'
+            '"partID":"prt_unknown",'
+            '"delta":"delta sin part.updated previo"'
+            '}}'
+        )
+        part_types: dict = {}
+        deltas, done = client._process_sse_event(
+            delta_event, "ses_unk", delta_count=0, part_types=part_types
+        )
+
+        assert deltas == ["delta sin part.updated previo"], (
+            f"Delta con partID desconocido NO debió descartarse (compat). "
+            f"Esperaba ['delta sin part.updated previo'], obtuve {deltas}."
+        )
+        assert done is False
+
+    def test_stream_mixed_reasoning_and_text(self):
+        """Stream mixto reasoning + text → solo se emite el delta de text.
+
+        Simula el escenario real: el agente emite un part de reasoning
+        (con su cadena de pensamiento), luego un part de text (la respuesta
+        al usuario), y finalmente ``session.idle``. Solo el delta de text
+        debe llegar al consumidor.
+        """
+        client = OpenCodeClient.__new__(OpenCodeClient)
+        client.settings = {}
+
+        session_id = "ses_mixed"
+        part_types: dict = {}
+
+        events = [
+            # 1) Registrar part de reasoning
+            '{"type":"message.part.updated",'
+            '"properties":{'
+            '"sessionID":"ses_mixed",'
+            '"part":{"id":"prt_r","type":"reasoning"}'
+            '}}',
+            # 2) Delta de reasoning → DEBE descartarse
+            '{"type":"message.part.delta",'
+            '"properties":{'
+            '"sessionID":"ses_mixed",'
+            '"partID":"prt_r",'
+            '"delta":"The user is asking for the agenda"'
+            '}}',
+            # 3) Registrar part de text
+            '{"type":"message.part.updated",'
+            '"properties":{'
+            '"sessionID":"ses_mixed",'
+            '"part":{"id":"prt_t","type":"text"}'
+            '}}',
+            # 4) Delta de text → DEBE emitirse
+            '{"type":"message.part.delta",'
+            '"properties":{'
+            '"sessionID":"ses_mixed",'
+            '"partID":"prt_t",'
+            '"delta":"El lunes arrancás"'
+            '}}',
+            # 5) session.idle → cierra el stream
+            '{"type":"session.idle",'
+            '"properties":{"sessionID":"ses_mixed"}'
+            '}',
+        ]
+
+        emitted: list[str] = []
+        delta_count = 0
+        stream_closed = False
+
+        for event_json in events:
+            deltas, done = client._process_sse_event(
+                event_json, session_id, delta_count=delta_count, part_types=part_types
+            )
+            for d in deltas:
+                emitted.append(d)
+                delta_count += 1
+            if done:
+                stream_closed = True
+                break
+
+        # ── Aserciones ────────────────────────────────────────────────
+        assert stream_closed, "session.idle debió cerrar el stream"
+        assert emitted == ["El lunes arrancás"], (
+            f"Solo el delta de text debió emitirse. Esperaba "
+            f"['El lunes arrancás'], obtuve {emitted}. "
+            "El reasoning NO debió emitirse al TTS."
+        )
+        # Verificar que SOLO se emitió 1 delta (no 2)
+        assert len(emitted) == 1, (
+            f"Se esperaba exactamente 1 delta emitido, se obtuvieron {len(emitted)}: "
+            f"{emitted}"
+        )
+        # Verificar que part_types registró ambos parts
+        assert part_types == {"prt_r": "reasoning", "prt_t": "text"}, (
+            f"part_types mal registrado. Esperaba "
+            f"{{'prt_r': 'reasoning', 'prt_t': 'text'}}, obtuve {part_types}"
+        )
+        # delta_count refleja los deltas efectivamente emitidos (1)
+        assert delta_count == 1

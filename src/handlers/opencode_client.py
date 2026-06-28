@@ -14,6 +14,11 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+# Tipos de part cuyos deltas NO se emiten al TTS (no son respuesta al usuario)
+_FILTERED_PART_TYPES = frozenset({
+    "reasoning", "tool", "file", "step-start", "step-finish", "compaction", "subtask",
+})
+
 
 class OpenCodeClient:
     """Cliente HTTP para interactuar con el agente opencode vía REST API.
@@ -347,6 +352,7 @@ class OpenCodeClient:
                 connected_seen = False
                 prompt_async_sent = False
                 saw_done = False
+                part_types: dict = {}
 
                 # Consumir TODO el stream con un único iter_lines().
                 for line_bytes in stream_response.iter_lines():
@@ -367,7 +373,7 @@ class OpenCodeClient:
                     if line == "" and data_buffer:
                         # Fin de un evento SSE: procesarlo.
                         deltas, done = self._process_sse_event(
-                            data_buffer, session_id, delta_count
+                            data_buffer, session_id, delta_count, part_types
                         )
                         for delta in deltas:
                             if not first_delta_logged:
@@ -434,7 +440,7 @@ class OpenCodeClient:
                 # Fin del stream: procesar cualquier evento residual en data_buffer
                 if data_buffer and not saw_done:
                     deltas, _ = self._process_sse_event(
-                        data_buffer, session_id, delta_count
+                        data_buffer, session_id, delta_count, part_types
                     )
                     for delta in deltas:
                         if not first_delta_logged:
@@ -472,7 +478,7 @@ class OpenCodeClient:
         )
 
     def _process_sse_event(
-        self, data_str: str, session_id: str, delta_count: int
+        self, data_str: str, session_id: str, delta_count: int, part_types: dict
     ) -> Tuple[List[str], bool]:
         """Procesa un evento SSE completo: parsea JSON, filtra por sessionID,
         y retorna tupla (deltas, done) o lanza error según el tipo de evento.
@@ -486,6 +492,9 @@ class OpenCodeClient:
             session_id: ID de sesión esperado para filtrar eventos.
             delta_count: Cantidad de deltas recibidos hasta ahora en este stream.
                 Se usa para descartar ``session.idle`` espurios (sin deltas).
+            part_types: Dict mutable ``partID -> part.type``, poblado por eventos
+                ``message.part.updated`` y consultado en ``message.part.delta``
+                para filtrar deltas que no son respuesta al usuario.
 
         Returns:
             Tupla (deltas, done): deltas es lista de strings, done es True si
@@ -522,7 +531,19 @@ class OpenCodeClient:
         if resolved_session_id != session_id:
             return [], False
 
-        if event_type in ("session.next.text.delta", "message.part.delta"):
+        if event_type == "message.part.updated":
+            # Registrar partID -> part.type para filtrar deltas posteriores.
+            # Acepta part en properties.part (v1) o data.part (v2).
+            part = properties.get("part") or data_field.get("part")
+            if part and "id" in part and "type" in part:
+                part_types[part["id"]] = part["type"]
+                logger.debug(
+                    "Part registrado: partID=%s, type=%s",
+                    part["id"],
+                    part["type"],
+                )
+            return [], False
+        elif event_type in ("session.next.text.delta", "message.part.delta"):
             # Acepta delta en properties.delta (v1) o data.delta (v2).
             # Para ``session.next.text.delta`` también se acepta el legacy
             # ``data.field.text`` por compatibilidad con servers v2 viejos.
@@ -535,9 +556,37 @@ class OpenCodeClient:
                 or data_field.get("delta")
                 or data_field.get("field", {}).get("text", "")
             )
-            if delta:
-                return [delta], False
-            return [], False
+            if not delta:
+                return [], False
+
+            # Filtrar deltas de message.part.delta por tipo de part.
+            # session.next.text.delta no tiene partID → se emite siempre.
+            if event_type == "message.part.delta":
+                part_id = properties.get("partID") or data_field.get("partID")
+                if part_id is not None and part_id in part_types:
+                    part_type = part_types[part_id]
+                    if part_type == "text":
+                        pass  # emitir
+                    elif part_type in _FILTERED_PART_TYPES:
+                        logger.debug(
+                            "Delta descartado: partID=%s, type=%s, delta=%r",
+                            part_id,
+                            part_type,
+                            delta,
+                        )
+                        return [], False
+                    # else: tipo no listado → emitir por defecto (defensivo)
+                elif part_id is not None:
+                    # partID desconocido (no se vio message.part.updated previo)
+                    # → emitir por defecto (compatibilidad con servers que no
+                    # emiten part.updated).
+                    logger.debug(
+                        "Delta emitido por defecto: partID=%s desconocido",
+                        part_id,
+                    )
+                # else: part_id es None → emitir por defecto
+
+            return [delta], False
         elif event_type == "session.idle":
             # Regla anti-stale: ignorar session.idle si aún no llegó ningún delta.
             # El server emite session.idle por sesión al cerrarse; si la suscripción

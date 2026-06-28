@@ -409,8 +409,9 @@ class TestUATProcessSSEEventFullCycle:
             '"delta":"Hola desde el UAT"'
             '}}'
         )
+        part_types: dict = {}
         deltas, done = client._process_sse_event(
-            delta_event, session_id, delta_count=0
+            delta_event, session_id, delta_count=0, part_types=part_types
         )
 
         # El delta DEBE extraerse (no quedar en []). Antes del fix, esto
@@ -433,7 +434,7 @@ class TestUATProcessSSEEventFullCycle:
             '{"type":"session.idle","properties":{"sessionID":"ses_uat_cycle"}}'
         )
         deltas, done = client._process_sse_event(
-            idle_event, session_id, delta_count=delta_count_after_delta
+            idle_event, session_id, delta_count=delta_count_after_delta, part_types=part_types
         )
 
         # session.idle válido (delta_count > 0) → done=True → cierra stream
@@ -472,8 +473,9 @@ class TestUATProcessSSEEventFullCycle:
             '"delta":"fragmento v2"'
             '}}'
         )
+        part_types: dict = {}
         deltas, done = client._process_sse_event(
-            delta_event, session_id, delta_count=0
+            delta_event, session_id, delta_count=0, part_types=part_types
         )
 
         assert deltas == ["fragmento v2"], (
@@ -486,8 +488,347 @@ class TestUATProcessSSEEventFullCycle:
             '{"type":"session.idle","data":{"sessionID":"ses_uat_v2"}}'
         )
         deltas, done = client._process_sse_event(
-            idle_event, session_id, delta_count=1
+            idle_event, session_id, delta_count=1, part_types=part_types
         )
 
         assert deltas == []
         assert done is True
+
+
+# ──────────────────────────────────────────────────────────────────
+# Test 3: UAT — filtrado de reasoning en streaming SSE
+# ──────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.unit
+class TestUATReasoningFilter:
+    """UAT: el filtrado de parts de reasoning funciona en el ciclo SSE.
+
+    Valida que ``_process_sse_event`` con la nueva signature (4º arg
+    ``part_types``) descarta los deltas de parts de tipo ``reasoning``
+    y emite solo los de tipo ``text``.
+
+    Escenario real (del bug report 2026-06-28): el agente emite
+    razonamiento en inglés ("The user is asking for their schedule...")
+    seguido de la respuesta al usuario en español ("El lunes arrancás
+    con Estudio Teclab..."). Solo el segundo debe llegar al TTS.
+    """
+
+    def test_uat_reasoning_filtered_text_emitted(self):
+        """Stream mixto reasoning + text → solo text llega al consumidor.
+
+        Simula la secuencia SSE real del bug report:
+
+            1. message.part.updated (reasoning, prt_r)
+            2. message.part.delta  (prt_r, "The user is asking...")
+            3. message.part.updated (text, prt_t)
+            4. message.part.delta  (prt_t, "El lunes arrancás...")
+            5. session.idle
+
+        Verifica que:
+            - El delta de reasoning se descarta (no se emite).
+            - El delta de text se emite.
+            - session.idle cierra el stream (delta_count=1 > 0).
+            - part_types registró ambos parts.
+        """
+        from handlers.opencode_client import OpenCodeClient
+
+        client = OpenCodeClient.__new__(OpenCodeClient)
+        client.settings = {}
+
+        session_id = "ses_uat_reasoning"
+        part_types: dict = {}
+
+        events = [
+            # 1) Registrar part de reasoning
+            '{"type":"message.part.updated",'
+            '"properties":{'
+            '"sessionID":"ses_uat_reasoning",'
+            '"part":{"id":"prt_r","type":"reasoning"}'
+            '}}',
+            # 2) Delta de reasoning → DEBE descartarse
+            '{"type":"message.part.delta",'
+            '"properties":{'
+            '"sessionID":"ses_uat_reasoning",'
+            '"partID":"prt_r",'
+            '"delta":"The user is asking for their schedule."'
+            '}}',
+            # 3) Registrar part de text
+            '{"type":"message.part.updated",'
+            '"properties":{'
+            '"sessionID":"ses_uat_reasoning",'
+            '"part":{"id":"prt_t","type":"text"}'
+            '}}',
+            # 4) Delta de text → DEBE emitirse
+            '{"type":"message.part.delta",'
+            '"properties":{'
+            '"sessionID":"ses_uat_reasoning",'
+            '"partID":"prt_t",'
+            '"delta":"El lunes arrancás con Estudio Teclab."'
+            '}}',
+            # 5) session.idle → cierra el stream
+            '{"type":"session.idle",'
+            '"properties":{"sessionID":"ses_uat_reasoning"}'
+            '}',
+        ]
+
+        emitted: list[str] = []
+        delta_count = 0
+        stream_closed = False
+
+        for event_json in events:
+            deltas, done = client._process_sse_event(
+                event_json, session_id, delta_count=delta_count,
+                part_types=part_types,
+            )
+            for d in deltas:
+                emitted.append(d)
+                delta_count += 1
+            if done:
+                stream_closed = True
+                break
+
+        # ── Aserciones ────────────────────────────────────────────────
+        assert stream_closed, (
+            "session.idle debió cerrar el stream. "
+            "Si no cerró, el delta de text no se emitió y delta_count "
+            "se quedó en 0 (regla anti-stale descartó el idle)."
+        )
+        assert emitted == ["El lunes arrancás con Estudio Teclab."], (
+            f"Solo el delta de text debió emitirse. Esperaba "
+            f"['El lunes arrancás con Estudio Teclab.'], obtuve {emitted}. "
+            "El reasoning NO debió emitirse al TTS."
+        )
+        assert len(emitted) == 1, (
+            f"Se esperaba exactamente 1 delta emitido, se obtuvieron "
+            f"{len(emitted)}: {emitted}"
+        )
+        assert part_types == {
+            "prt_r": "reasoning",
+            "prt_t": "text",
+        }, f"part_types mal registrado: {part_types}"
+        assert delta_count == 1
+
+
+@pytest.mark.integration
+class TestUATReasoningFilterPipeline:
+    """UAT: pipeline streaming con filtrado de reasoning produce bytes > 0.
+
+    Criterio de aceptación del usuario (textual):
+
+        > usar comando.wav del entorno dev y que haya audio reproducido
+        > con bytes > 0
+
+    Este test simula un stream SSE con parts de reasoning (que deben
+    filtrarse) y parts de text (que deben llegar al TTS), pasa los
+    deltas filtrados por SentenceBuffer + Kokoro TTS, y verifica que
+    el PCM resultante tiene bytes > 0.
+
+    Además verifica que el contenido de reasoning NO aparece en el
+    texto sintetizado y que la respuesta al usuario SÍ aparece.
+    """
+
+    def test_uat_reasoning_filter_pipeline_produces_audio(
+        self, real_settings: dict
+    ):
+        """Pipeline con reasoning + text → bytes > 0 y sin reasoning en TTS.
+
+        Flujo:
+            1. STT real con Whisper sobre comando.wav (verifica que el
+               audio de dev funciona).
+            2. Simular ``send_command_stream`` con eventos SSE que
+               incluyen parts de reasoning y text.
+            3. Filtrar con ``_process_sse_event`` (el fix).
+            4. SentenceBuffer agrupa los deltas de text en oraciones.
+            5. Kokoro TTS sintetiza → PCM bytes.
+            6. Verificar total_bytes > 0.
+            7. Verificar que el texto no contiene el reasoning.
+        """
+        wav_path = _comando_wav_path()
+
+        # ── Skip si los modelos locales no están disponibles ──────────
+        if not _whisper_available():
+            pytest.skip(
+                "Whisper no disponible (faster_whisper no instalado o "
+                "modelo 'small' no descargado en cache de HuggingFace)."
+            )
+        if not _kokoro_available(real_settings):
+            pytest.skip(
+                "Kokoro no disponible (kokoro_onnx no instalado O "
+                "modelos no encontrados en disco)."
+            )
+
+        # ── 1. STT real con Whisper local ────────────────────────────
+        from handlers.whisper_stt_client import WhisperSTTClient
+
+        stt = WhisperSTTClient(real_settings)
+        transcription = stt.transcribe(wav_path)
+
+        assert isinstance(transcription, str)
+        assert len(transcription) > 0, (
+            "Whisper retornó string vacío. Verificar comando.wav."
+        )
+        print(f"\n[UAT-RF] STT transcripción: {transcription!r}")
+
+        # ── 2. Simular stream SSE con reasoning + text ───────────────
+        # Reproduce el patrón del bug report: el agente razona en
+        # inglés y luego responde en español. Solo el text debe llegar
+        # al TTS.
+        from handlers.opencode_client import OpenCodeClient
+
+        client = OpenCodeClient.__new__(OpenCodeClient)
+        client.settings = {}
+
+        session_id = "ses_uat_rf"
+        part_types: dict = {}
+
+        # Texto de reasoning (NO debe llegar al TTS)
+        reasoning_text = "The user is asking for their schedule for next week."
+
+        # Texto de respuesta al usuario (SÍ debe llegar al TTS)
+        response_text = "El lunes arrancás con Estudio Teclab de 18 a 20."
+
+        # Construir eventos SSE: part.updated + deltas fragmentados
+        sse_events: list[str] = []
+
+        # 1) Registrar part de reasoning
+        sse_events.append(
+            '{"type":"message.part.updated",'
+            '"properties":{'
+            '"sessionID":"ses_uat_rf",'
+            '"part":{"id":"prt_r","type":"reasoning"}'
+            '}}'
+        )
+        # 2) Deltas de reasoning (fragmentados como en la vida real)
+        reasoning_chunks = [
+            reasoning_text[i:i + 20]
+            for i in range(0, len(reasoning_text), 20)
+        ]
+        for chunk in reasoning_chunks:
+            sse_events.append(
+                '{"type":"message.part.delta",'
+                '"properties":{'
+                '"sessionID":"ses_uat_rf",'
+                '"partID":"prt_r",'
+                f'"delta":"{chunk}"'
+                '}}'
+            )
+        # 3) Registrar part de text
+        sse_events.append(
+            '{"type":"message.part.updated",'
+            '"properties":{'
+            '"sessionID":"ses_uat_rf",'
+            '"part":{"id":"prt_t","type":"text"}'
+            '}}'
+        )
+        # 4) Deltas de text (fragmentados)
+        response_chunks = [
+            response_text[i:i + 15]
+            for i in range(0, len(response_text), 15)
+        ]
+        for chunk in response_chunks:
+            sse_events.append(
+                '{"type":"message.part.delta",'
+                '"properties":{'
+                '"sessionID":"ses_uat_rf",'
+                '"partID":"prt_t",'
+                f'"delta":"{chunk}"'
+                '}}'
+            )
+        # 5) session.idle
+        sse_events.append(
+            '{"type":"session.idle",'
+            '"properties":{"sessionID":"ses_uat_rf"}'
+            '}'
+        )
+
+        # ── 3. Procesar eventos SSE y recolectar deltas emitidos ─────
+        emitted_deltas: list[str] = []
+        delta_count = 0
+        stream_closed = False
+
+        for event_json in sse_events:
+            deltas, done = client._process_sse_event(
+                event_json, session_id, delta_count=delta_count,
+                part_types=part_types,
+            )
+            for d in deltas:
+                emitted_deltas.append(d)
+                delta_count += 1
+            if done:
+                stream_closed = True
+                break
+
+        assert stream_closed, "session.idle no cerró el stream"
+        assert delta_count > 0, (
+            "No se emitió ningún delta. El filtrado descartó TODO "
+            "(over-filtering). Verificar que los parts de text se emiten."
+        )
+
+        # Reconstruir el texto completo que llegó al TTS
+        tts_text = "".join(emitted_deltas)
+        print(f"[UAT-RF] Texto al TTS: {tts_text!r}")
+
+        # ── Verificar que el reasoning NO está en el texto del TTS ────
+        assert "The user is asking" not in tts_text, (
+            f"El reasoning filtró al TTS. El texto contiene "
+            f"'The user is asking'. Texto TTS: {tts_text!r}"
+        )
+        assert "schedule" not in tts_text, (
+            f"El reasoning filtró al TTS. Contiene 'schedule'. "
+            f"Texto TTS: {tts_text!r}"
+        )
+
+        # ── Verificar que la respuesta SÍ está en el texto del TTS ───
+        assert "Estudio Teclab" in tts_text, (
+            f"La respuesta al usuario no llegó al TTS. "
+            f"Esperaba 'Estudio Teclab' en el texto. "
+            f"Texto TTS: {tts_text!r}"
+        )
+
+        # ── 4. SentenceBuffer real ───────────────────────────────────
+        from handlers.sentence_buffer import SentenceBuffer
+
+        sentence_buffer = SentenceBuffer()
+        all_sentences: list[str] = []
+
+        for delta in emitted_deltas:
+            for sentence in sentence_buffer.add(delta):
+                all_sentences.append(sentence)
+                print(f"[UAT-RF] Oración: {sentence!r}")
+
+        for sentence in sentence_buffer.flush():
+            all_sentences.append(sentence)
+            print(f"[UAT-RF] Oración flush: {sentence!r}")
+
+        assert len(all_sentences) >= 1, (
+            "SentenceBuffer no extrajo oraciones de los deltas de text."
+        )
+
+        # ── 5. Kokoro TTS real ───────────────────────────────────────
+        from handlers.kokoro_tts_client import KokoroTTSClient
+
+        tts = KokoroTTSClient(real_settings)
+
+        def sentence_iterator() -> Iterator[str]:
+            yield from all_sentences
+
+        pcm_chunks = list(tts.synthesize_sentence_stream(sentence_iterator()))
+
+        # ── 6. Criterio de aceptación: total_bytes > 0 ────────────────
+        total_bytes = sum(len(chunk) for chunk in pcm_chunks)
+        num_chunks = len(pcm_chunks)
+
+        print(f"\n[UAT-RF] ── Resultado ──")
+        print(f"[UAT-RF] Oraciones sintetizadas: {len(all_sentences)}")
+        print(f"[UAT-RF] Chunks PCM: {num_chunks}")
+        print(f"[UAT-RF] Total bytes de audio: {total_bytes}")
+        print(f"[UAT-RF] ──────────────────")
+
+        assert total_bytes > 0, (
+            f"Criterio de aceptación FALLÓ: el pipeline produjo "
+            f"{total_bytes} bytes (esperaba > 0). "
+            f"Oraciones={len(all_sentences)}, chunks={num_chunks}. "
+            "El filtrado de reasoning puede haber descartado también "
+            "los deltas de text (over-filtering)."
+        )
