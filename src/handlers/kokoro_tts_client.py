@@ -7,6 +7,7 @@ descarga manual de los archivos de modelo).
 
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Iterator
 
@@ -94,12 +95,23 @@ class KokoroTTSClient:
         self._ensure_model_loaded()
 
         cfg = self.settings["local"]["kokoro"]
+
+        # Colapsar cualquier secuencia de whitespace (newlines, tabs, espacios múltiples) a un solo espacio.
+        # Previene el WARNING "words count mismatch" de phonemizer y artefactos de audio
+        # (kokoro-onnx 0.5.0 no normaliza newlines internos — ver PR upstream #185).
+        text_normalized = re.sub(r"\s+", " ", text).strip()
+        logger.debug(
+            "Kokoro TTS — texto normalizado='%s'",
+            text_normalized[:120] + ("..." if len(text_normalized) > 120 else ""),
+        )
+
         try:
             samples, sample_rate = self._kokoro.create(
-                text,
+                text_normalized,
                 voice=cfg["voice"],
                 speed=cfg["speed"],
                 lang=cfg["lang"],
+                trim=False,  # evitar corte agresivo de la última sílaba
             )
         except Exception as exc:
             logger.error("Kokoro TTS falló — %s: %s", type(exc).__name__, exc)

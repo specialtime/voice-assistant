@@ -11,6 +11,7 @@ sin modelo real. Se mockea ``kokoro_onnx.Kokoro`` con ``unittest.mock``.
 from __future__ import annotations
 
 import logging
+import re
 import sys
 import types
 from pathlib import Path
@@ -66,8 +67,13 @@ def kokoro_settings() -> dict:
 # ──────────────────────────────────────────────────────────────────
 
 
-def _fake_create(text, voice, speed, lang):
-    """Retorna (samples float32, sample_rate 24000) como Kokoro real."""
+def _fake_create(text, voice, speed, lang, trim=None):
+    """Retorna (samples float32, sample_rate 24000) como Kokoro real.
+
+    Acepta ``trim`` para mantener compatibilidad con la nueva firma de
+    ``Kokoro.create()`` tras el fix de phonemizer mismatch (kokoro-onnx
+    ahora recibe ``trim=False`` desde KokoroTTSClient.synthesize).
+    """
     # 100 samples float32 en [-1, 1]
     samples = np.array([0.5, -0.5, 0.0] * 33 + [0.25], dtype=np.float32)
     return samples, 24000
@@ -202,7 +208,7 @@ class TestKokoroTTSClient:
 
         Verificar que los samples resultantes están en rango int16 [-32768, 32767].
         """
-        def fake_create_out_of_range(text, voice, speed, lang):
+        def fake_create_out_of_range(text, voice, speed, lang, trim=None):
             samples = np.array([2.0, -2.0, 0.5, -0.5], dtype=np.float32)
             return samples, 24000
 
@@ -251,3 +257,149 @@ class TestKokoroTTSClient:
                 # Verificar que el path sensible NO aparece en ningún log
                 log_text = caplog.text
                 assert "SECRET_USER_DO_NOT_LEAK_999" not in log_text
+
+
+# ──────────────────────────────────────────────────────────────────
+# Tests de normalización de whitespace (fix kokoro phonemizer mismatch)
+# ──────────────────────────────────────────────────────────────────
+#
+# Estos tests cubren el fix de la spec ``specs/bug_kokoro_phonemizer_mismatch.md``.
+# El handler ahora aplica ``re.sub(r"\s+", " ", text).strip()`` antes de
+# invocar ``Kokoro.create()`` y pasa ``trim=False``. Los tests verifican
+# que esa normalización es correcta y NO destruye caracteres relevantes
+# (em-dash, números con dos puntos, ñ/acentos).
+
+
+@pytest.mark.unit
+class TestKokoroNormalization:
+    """Suite: normalización de whitespace en KokoroTTSClient.synthesize."""
+
+    _PROD_MULTILINE = (
+        "Mañana lunes 29 de junio tenés:\n"
+        "18:00 a 20:00 — Estudio Teclab\n"
+        "20:00 a 21:00 — Ejercicio / Entrenamiento\n"
+        "El resto del día"
+    )
+
+    def test_a_multiline_newlines_collapsed(self, kokoro_settings):
+        """Test A — Texto multilinea del log de prod: newlines colapsados a espacios.
+
+        Verifica que ``Kokoro.create`` recibe el primer arg posicional sin
+        ``\n`` y con espacios simples entre palabras.
+        """
+        with patch("handlers.kokoro_tts_client.Path.exists", return_value=True):
+            with patch("handlers.kokoro_tts_client.Kokoro") as MockKokoro:
+                mock_instance = MockKokoro.return_value
+                # MagicMock con side_effect preserva call_args / assert_called_once
+                mock_instance.create = MagicMock(side_effect=_fake_create)
+
+                client = KokoroTTSClient(kokoro_settings)
+                client.synthesize(self._PROD_MULTILINE)
+
+                # El handler llamó a create exactamente una vez
+                mock_instance.create.assert_called_once()
+                call_args = mock_instance.create.call_args
+                received_text = call_args.args[0]
+
+                # Sin newlines, sin tabs
+                assert "\n" not in received_text
+                assert "\t" not in received_text
+                assert "\r" not in received_text
+
+                # Sin secuencias de 2+ espacios consecutivos
+                assert "  " not in received_text
+
+                # Sanity: el texto sigue conteniendo el contenido (sin contar \n)
+                expected_normalized = re.sub(r"\s+", " ", self._PROD_MULTILINE).strip()
+                assert received_text == expected_normalized
+
+    def test_b_em_dash_and_colon_preserved(self, kokoro_settings):
+        """Test B — Em-dash (U+2014) y números con dos puntos NO son tocados.
+
+        La normalización solo colapsa whitespace, no otros caracteres.
+        """
+        input_text = "Tu cita es a las 18:00 — no te olvides"
+
+        with patch("handlers.kokoro_tts_client.Path.exists", return_value=True):
+            with patch("handlers.kokoro_tts_client.Kokoro") as MockKokoro:
+                mock_instance = MockKokoro.return_value
+                mock_instance.create = MagicMock(side_effect=_fake_create)
+
+                client = KokoroTTSClient(kokoro_settings)
+                client.synthesize(input_text)
+
+                received_text = mock_instance.create.call_args.args[0]
+
+                # Em-dash presente
+                assert "\u2014" in received_text
+                # "18:00" presente (los dos puntos no son whitespace)
+                assert "18:00" in received_text
+                # Sin espacios múltiples introducidos
+                assert "  " not in received_text
+
+    def test_c_trim_false_always_passed(self, kokoro_settings):
+        """Test C — En TODAS las llamadas a ``create()`` se pasa ``trim=False``.
+
+        Verifica en múltiples invocaciones que el kwarg ``trim`` es siempre
+        ``False`` (no ``True`` ni ``None``).
+        """
+        with patch("handlers.kokoro_tts_client.Path.exists", return_value=True):
+            with patch("handlers.kokoro_tts_client.Kokoro") as MockKokoro:
+                mock_instance = MockKokoro.return_value
+                mock_instance.create = MagicMock(side_effect=_fake_create)
+
+                client = KokoroTTSClient(kokoro_settings)
+                client.synthesize("primera llamada")
+                client.synthesize("segunda\nllamada\ncon\nnewlines")
+                client.synthesize("tercera con   espacios   múltiples")
+
+                # 3 invocaciones, todas con trim=False
+                assert mock_instance.create.call_count == 3
+                for call in mock_instance.create.call_args_list:
+                    assert "trim" in call.kwargs, "Falta kwarg 'trim'"
+                    assert call.kwargs["trim"] is False, (
+                        f"Se esperaba trim=False, se obtuvo {call.kwargs['trim']!r}"
+                    )
+
+    def test_d_tabs_and_multiple_spaces_collapsed(self, kokoro_settings):
+        """Test D — Tabs y secuencias de espacios múltiples → un solo espacio."""
+        input_text = "hola\t\tmundo   multiple   espacios"
+
+        with patch("handlers.kokoro_tts_client.Path.exists", return_value=True):
+            with patch("handlers.kokoro_tts_client.Kokoro") as MockKokoro:
+                mock_instance = MockKokoro.return_value
+                mock_instance.create = MagicMock(side_effect=_fake_create)
+
+                client = KokoroTTSClient(kokoro_settings)
+                client.synthesize(input_text)
+
+                received_text = mock_instance.create.call_args.args[0]
+
+                # Texto exacto esperado (post-normalización)
+                assert received_text == "hola mundo multiple espacios"
+
+    def test_e_synthesize_stream_inherits_normalization(self, kokoro_settings):
+        """Test E — ``synthesize_stream`` también normaliza el texto antes de ``create``.
+
+        Verifica que el texto multilinea que entra a ``synthesize_stream``
+        llega normalizado (sin newlines) a ``Kokoro.create``.
+        """
+        input_text = "línea uno\nlínea dos\nlínea tres"
+
+        with patch("handlers.kokoro_tts_client.Path.exists", return_value=True):
+            with patch("handlers.kokoro_tts_client.Kokoro") as MockKokoro:
+                mock_instance = MockKokoro.return_value
+                mock_instance.create = MagicMock(side_effect=_fake_create)
+
+                client = KokoroTTSClient(kokoro_settings)
+                # Consumir el iterador para forzar la materialización
+                chunks = list(client.synthesize_stream(input_text))
+
+                # Hubo al menos un chunk (no falló)
+                assert len(chunks) >= 1
+                # El texto que llegó a create fue normalizado
+                received_text = mock_instance.create.call_args.args[0]
+                assert "\n" not in received_text
+                assert received_text == "línea uno línea dos línea tres"
+                # Además, trim=False se propaga a través de synthesize_stream
+                assert mock_instance.create.call_args.kwargs.get("trim") is False

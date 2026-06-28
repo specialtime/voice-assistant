@@ -186,6 +186,8 @@ Para usar Kokoro en vez de Piper:
 
 > **Nota:** Si el campo `tts_engine` falta o es inválido, se usa `"piper"` por defecto (backward-compatible).
 
+> **Normalización de texto:** El handler de Kokoro colapsa cualquier secuencia de whitespace (newlines, tabs, espacios múltiples) a un solo espacio antes de sintetizar, y deshabilita el `trim` de silencios finales de kokoro-onnx. Esto previene el WARNING `phonemizer: words count mismatch` cuando el agente devuelve texto multilinea (ej. listas con saltos de línea) y evita que el audio se corte abruptamente al final. Ver `specs/bug_kokoro_phonemizer_mismatch.md`.
+
 ### 5. Levantar el servidor OpenCode
 
 ```powershell
