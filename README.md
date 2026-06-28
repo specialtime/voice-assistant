@@ -138,9 +138,20 @@ El archivo `config/settings.json` define modelos, voces, timeouts y logging. Rev
 El pipeline usa modelos locales como **primario** para STT y TTS, con fallback automático a APIs cloud (Gemini/Azure) si los modelos locales fallan.
 
 **STT — Whisper local (faster-whisper):**
-- Modelo: `small` (244M params, ~2GB VRAM con int8)
+- Modelo: `small` (244M params, ~1GB VRAM con `int8_float16`)
 - Corre en GPU (CUDA). Si no hay GPU, cae a CPU automáticamente.
 - El modelo se descarga automáticamente en la primera transcripción (~466MB).
+
+**Parámetros de precisión (`config/settings.json` → `local.whisper`):**
+
+| Parámetro | Valor | Descripción |
+|---|---|---|
+| `compute_type` | `int8_float16` | Pesos int8 + activaciones float16. Mejor precisión que `int8` puro con la misma VRAM (~1GB con modelo small). Recomendado por faster-whisper para GPU. |
+| `vad_filter` | `true` | Activa Silero VAD para filtrar silencios antes de transcribir. Reduce alucinaciones y texto fantasma. |
+| `vad_min_silence_duration_ms` | `500` | Silencios más cortos que 500ms no se cortan. Para comandos de voz cortos. |
+| `initial_prompt` | string de contexto | Texto que guía la transcripción: vocabulario, estilo, jerga técnica. Equivalente al `stt_prompt` de Gemini. Ej: "Comandos de voz en español rioplatense. Términos técnicos: Chrome, VSCode, terminal, git, PowerShell, opencode, Python, Docker." |
+| `hotwords` | string de palabras clave | Términos técnicos que Whisper debe priorizar en el beam search. Separados por espacios. Ej: "Chrome VSCode PowerShell opencode Python Docker terminal git". |
+| `condition_on_previous_text` | `false` | No arrastra contexto entre segmentos. Evita loops de repetición en comandos cortos. Default de faster-whisper es `true`. |
 
 **TTS — Piper local (piper-tts):**
 - Voz: `es_AR-daniela-high` (114MB, ONNX Runtime, CPU)
