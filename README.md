@@ -1,6 +1,6 @@
 ﻿# Dev-Cortex — Asistente de Voz para Windows
 
-Asistente de voz en segundo plano para Windows que interactúa con el sistema operativo mediante lenguaje natural. Arquitectura "Dos Cerebros" con aislamiento estricto: el orquestador Python captura audio, transcribe con Gemini, razona con OpenCode y responde con TTS (Azure/Gemini).
+Asistente de voz en segundo plano para Windows que interactúa con el sistema operativo mediante lenguaje natural. Arquitectura "Dos Cerebros" con aislamiento estricto: el orquestador Python captura audio, transcribe con Whisper (local) o Gemini (cloud fallback), razona con OpenCode y responde con TTS Piper (local) o Azure/Gemini (cloud fallback).
 
 ---
 
@@ -22,9 +22,9 @@ Asistente de voz en segundo plano para Windows que interactúa con el sistema op
 
 **Pipeline de un comando:**
 1. **Trigger:** `Alt+V` activa grabación.
-2. **STT:** Audio → Gemini (`gemini-3.1-flash-lite` con fallback).
+2. **STT:** Audio → Whisper local (`small`, GPU) con fallback a Gemini (`gemini-3.1-flash-lite`).
 3. **Razonamiento:** Texto → OpenCode (agente `asistente_voz`).
-4. **TTS:** Respuesta SSML → Azure/Gemini → altavoces.
+4. **TTS:** Respuesta SSML → Piper local (`es_AR-daniela-high`, CPU) con fallback a Gemini → Azure → altavoces.
 
 **Por qué proceso usuario (no servicio):** un asistente de voz necesita desktop (overlay tkinter), audio (micrófono/altavoces) y hotkey global. Los servicios de Windows corren en Session 0 (aislada, sin desktop desde Vista) — no pueden mostrar ventanas ni lanzar programas visibles. Correr todo en Session 1 es más simple y funciona correctamente.
 
@@ -53,10 +53,12 @@ dev-cortex/
 │   ├── main.py                 # Punto de entrada + máquina de estados
 │   └── handlers/               # Handlers del pipeline
 │       ├── audio_manager.py     #   Grabación y reproducción de audio
-│       ├── gemini_stt_client.py #   STT (Speech-to-Text) con Gemini
+│       ├── whisper_stt_client.py #  STT local (Whisper, GPU, primario)
+│       ├── gemini_stt_client.py #   STT cloud (Gemini, fallback)
 │       ├── opencode_client.py   #   Cliente del cerebro (OpenCode serve)
-│       ├── gemini_tts_client.py #   TTS con Gemini (fallback)
-│       ├── azure_tts_client.py  #   TTS con Azure Cognitive Services
+│       ├── piper_tts_client.py  #   TTS local (Piper, CPU, primario)
+│       ├── gemini_tts_client.py #   TTS cloud (Gemini, fallback 1)
+│       ├── azure_tts_client.py  #   TTS cloud (Azure, fallback 2 streaming)
 │       ├── response_parser.py  #   Parser de respuestas SSML
 │       └── overlay.py           #   Overlay visual (chip tkinter)
 └── tests/                      # Suite de tests
@@ -65,13 +67,16 @@ dev-cortex/
     ├── test_audio_manager.py
     ├── test_e2e_scenarios.py
     ├── test_gemini_stt_client.py
+    ├── test_local_integration.py #  Tests de failover chain local→cloud
     ├── test_logging.py
     ├── test_opencode_client.py
     ├── test_opencode_wrapper.py
     ├── test_overlay.py
+    ├── test_piper_tts_client.py #  Tests Piper TTS local
     ├── test_response_parser.py
     ├── test_state_machine.py
-    └── test_tts_clients.py
+    ├── test_tts_clients.py
+    └── test_whisper_stt_client.py # Tests Whisper STT local
 ```
 
 ---
@@ -113,7 +118,33 @@ OPENCODE_BASE_URL=http://127.0.0.1:57214
 
 El archivo `config/settings.json` define modelos, voces, timeouts y logging. Revisar que los valores sean correctos para tu entorno.
 
-### 4. Levantar el servidor OpenCode
+### 4. Modelos locales (STT y TTS)
+
+El pipeline usa modelos locales como **primario** para STT y TTS, con fallback automático a APIs cloud (Gemini/Azure) si los modelos locales fallan.
+
+**STT — Whisper local (faster-whisper):**
+- Modelo: `small` (244M params, ~2GB VRAM con int8)
+- Corre en GPU (CUDA). Si no hay GPU, cae a CPU automáticamente.
+- El modelo se descarga automáticamente en la primera transcripción (~466MB).
+
+**TTS — Piper local (piper-tts):**
+- Voz: `es_AR-daniela-high` (114MB, ONNX Runtime, CPU)
+- La voz se descarga automáticamente en la primera síntesis a `models/piper-voices/`.
+- No compite por VRAM (corre en CPU).
+
+**Pre-descarga opcional** (evita latencia en el primer uso):
+
+```powershell
+# Pre-descargar modelo Whisper
+python -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cuda', compute_type='int8')"
+
+# Pre-descargar voz Piper
+python -c "from piper.download_voices import download_voice; from pathlib import Path; download_voice('es_AR-daniela-high', Path('models/piper-voices'))"
+```
+
+> **Hardware mínimo:** 4GB VRAM para Whisper small en GPU. Piper corre en CPU. Si no tienes GPU, Whisper cae a CPU (más lento pero funcional).
+
+### 5. Levantar el servidor OpenCode
 
 ```powershell
 $env:OPENCODE_SERVER_PASSWORD = "<tu_pass>"
@@ -127,7 +158,7 @@ curl http://127.0.0.1:57214/global/health
 # → {"healthy":true}
 ```
 
-### 5. Iniciar el orquestador
+### 6. Iniciar el orquestador
 
 ```powershell
 python src\main.py
@@ -139,7 +170,7 @@ O usar el script de arranque completo:
 scripts\start_cortex.bat
 ```
 
-### 6. Verificar funcionamiento
+### 7. Verificar funcionamiento
 
 1. Presionar `Alt+V` → debe aparecer chip "● Grabando..." abajo al centro.
 2. Hablar un comando (ej: "abrí Chrome").
@@ -248,9 +279,11 @@ Detalle técnico de la suite (cobertura por módulo, tests de secrets) en [`AGEN
 | Componente | Tecnología |
 |---|---|
 | Orquestador | Python 3.10+ (`keyboard`, `httpx`, `sounddevice`, `numpy`) |
-| STT | Google AI Studio — `gemini-3.1-flash-lite` (fallback: `gemini-2.5-flash-lite`) |
+| STT primario | Whisper local (`faster-whisper`, modelo `small`, GPU CUDA, int8) |
+| STT fallback | Google AI Studio — `gemini-3.1-flash-lite` (fallback: `gemini-2.5-flash-lite`) |
 | Cerebro | OpenCode serve (agente `asistente_voz`, bash + memoria) |
-| TTS primario | Azure Cognitive Services (SSML, `es-MX-JorgeNeural`) |
-| TTS fallback | Gemini (`gemini-3.1-flash-tts-preview`, voz `Charon`) |
+| TTS primario | Piper local (`piper-tts`, voz `es_AR-daniela-high`, ONNX Runtime, CPU) |
+| TTS fallback 1 | Gemini (`gemini-3.1-flash-tts-preview`, voz `Charon`) |
+| TTS fallback 2 | Azure Cognitive Services (SSML, `es-MX-JorgeNeural`, streaming) |
 | Memoria | Plugin `opencode-mem` (BD vectorial local) |
 | Overlay | tkinter (chip visual durante grabación/procesamiento) |
