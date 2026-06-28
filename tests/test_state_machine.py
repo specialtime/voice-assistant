@@ -62,6 +62,7 @@ class TestVoiceAssistantStateMachine:
              patch("main.GeminiSTTClient") as mock_stt, \
              patch("main.WhisperSTTClient") as mock_wstt, \
              patch("main.PiperTTSClient") as mock_ptts, \
+             patch("main.KokoroTTSClient") as mock_ktts, \
              patch("main.AudioManager") as mock_am, \
              patch("main.load_dotenv"):
 
@@ -69,6 +70,7 @@ class TestVoiceAssistantStateMachine:
             mock_stt.return_value = MagicMock(name="GeminiSTTClient")
             mock_wstt.return_value = MagicMock(name="WhisperSTTClient")
             mock_ptts.return_value = MagicMock(name="PiperTTSClient")
+            mock_ktts.return_value = MagicMock(name="KokoroTTSClient")
             mock_oc.return_value = MagicMock(name="OpenCodeClient")
             mock_gtts.return_value = MagicMock(name="GeminiTTSClient")
             mock_atts.return_value = MagicMock(name="AzureTTSClient")
@@ -151,7 +153,7 @@ class TestVoiceAssistantStateMachine:
             "[STYLE: cheerful] Listo, abrí Chrome"
         )
         # Piper TTS falla
-        patched_assistant._piper_tts.synthesize.side_effect = RuntimeError(
+        patched_assistant._local_tts.synthesize.side_effect = RuntimeError(
             "Piper falló"
         )
         # Gemini TTS falla (fuerza el fallback a Azure)
@@ -179,7 +181,7 @@ class TestVoiceAssistantStateMachine:
         assert stream_arg is patched_assistant._azure_tts.synthesize_stream.return_value
 
         # Piper y Gemini synthesize fueron llamados
-        patched_assistant._piper_tts.synthesize.assert_called_once()
+        patched_assistant._local_tts.synthesize.assert_called_once()
         patched_assistant._gemini_tts.synthesize.assert_called_once()
         # play_audio NO se llamó (Azure streaming ya reprodujo)
         patched_assistant._audio.play_audio.assert_not_called()
@@ -195,7 +197,7 @@ class TestVoiceAssistantStateMachine:
             "[STYLE: cheerful] Listo"
         )
         # Forzar los 3 TTS a None
-        patched_assistant._piper_tts = None
+        patched_assistant._local_tts = None
         patched_assistant._gemini_tts = None
         patched_assistant._azure_tts = None
 
@@ -365,7 +367,7 @@ class TestVoiceAssistantStateMachine:
         # send_command fue llamado (side_effect incrementó gen después)
         patched_assistant._opencode.send_command.assert_called_once()
         # TTS NO se invocó
-        patched_assistant._piper_tts.synthesize.assert_not_called()
+        patched_assistant._local_tts.synthesize.assert_not_called()
         # overlay.set_state NO fue llamado con "speaking"
         set_state_calls = patched_assistant._overlay.set_state.call_args_list
         speaking_calls = [
@@ -411,7 +413,7 @@ class TestVoiceAssistantStateMachine:
             "[STYLE: cheerful] Listo, abrí Chrome"
         )
         # Piper TTS retorna bytes PCM → play_audio (no streaming)
-        patched_assistant._piper_tts.synthesize.return_value = b"\x00" * 48000
+        patched_assistant._local_tts.synthesize.return_value = b"\x00" * 48000
 
         patched_assistant.run_pipeline("/tmp/fake.wav")
 
@@ -434,7 +436,7 @@ class TestVoiceAssistantStateMachine:
         patched_assistant._opencode.send_command.return_value = (
             "[STYLE: cheerful] Listo"
         )
-        patched_assistant._piper_tts.synthesize.return_value = b"\x00" * 48000
+        patched_assistant._local_tts.synthesize.return_value = b"\x00" * 48000
 
         patched_assistant.run_pipeline("/tmp/fake.wav")
 
@@ -468,7 +470,7 @@ class TestVoiceAssistantStateMachine:
 
         patched_assistant._whisper_stt.transcribe.return_value = "test"
         patched_assistant._opencode.send_command.side_effect = tracked_send
-        patched_assistant._piper_tts.synthesize.return_value = b"\x00" * 48000
+        patched_assistant._local_tts.synthesize.return_value = b"\x00" * 48000
 
         # Lanzar dos run_pipeline en paralelo
         t1 = threading.Thread(
@@ -498,7 +500,7 @@ class TestVoiceAssistantStateMachine:
         """Whisper STT OK → Gemini STT NO se llama."""
         patched_assistant._whisper_stt.transcribe.return_value = "abrí chrome"
         patched_assistant._opencode.send_command.return_value = "[STYLE: cheerful] Listo"
-        patched_assistant._piper_tts.synthesize.return_value = b"\x00" * 48000
+        patched_assistant._local_tts.synthesize.return_value = b"\x00" * 48000
 
         patched_assistant.run_pipeline("/tmp/fake.wav")
 
@@ -510,7 +512,7 @@ class TestVoiceAssistantStateMachine:
         patched_assistant._whisper_stt.transcribe.side_effect = RuntimeError("Whisper falló")
         patched_assistant._stt.transcribe.return_value = "abrí chrome"
         patched_assistant._opencode.send_command.return_value = "[STYLE: cheerful] Listo"
-        patched_assistant._piper_tts.synthesize.return_value = b"\x00" * 48000
+        patched_assistant._local_tts.synthesize.return_value = b"\x00" * 48000
 
         patched_assistant.run_pipeline("/tmp/fake.wav")
 
@@ -521,11 +523,11 @@ class TestVoiceAssistantStateMachine:
         """Piper TTS OK → Gemini y Azure NO se llaman."""
         patched_assistant._whisper_stt.transcribe.return_value = "abrí chrome"
         patched_assistant._opencode.send_command.return_value = "[STYLE: cheerful] Listo"
-        patched_assistant._piper_tts.synthesize.return_value = b"\x00" * 48000
+        patched_assistant._local_tts.synthesize.return_value = b"\x00" * 48000
 
         patched_assistant.run_pipeline("/tmp/fake.wav")
 
-        patched_assistant._piper_tts.synthesize.assert_called_once()
+        patched_assistant._local_tts.synthesize.assert_called_once()
         patched_assistant._gemini_tts.synthesize.assert_not_called()
         patched_assistant._azure_tts.synthesize_stream.assert_not_called()
 
@@ -533,12 +535,12 @@ class TestVoiceAssistantStateMachine:
         """Piper TTS falla → Gemini TTS fallback OK."""
         patched_assistant._whisper_stt.transcribe.return_value = "abrí chrome"
         patched_assistant._opencode.send_command.return_value = "[STYLE: cheerful] Listo"
-        patched_assistant._piper_tts.synthesize.side_effect = RuntimeError("Piper falló")
+        patched_assistant._local_tts.synthesize.side_effect = RuntimeError("Piper falló")
         patched_assistant._gemini_tts.synthesize.return_value = b"\x00" * 48000
 
         patched_assistant.run_pipeline("/tmp/fake.wav")
 
-        patched_assistant._piper_tts.synthesize.assert_called_once()
+        patched_assistant._local_tts.synthesize.assert_called_once()
         patched_assistant._gemini_tts.synthesize.assert_called_once()
         patched_assistant._azure_tts.synthesize_stream.assert_not_called()
 
@@ -546,7 +548,7 @@ class TestVoiceAssistantStateMachine:
         """Piper, Gemini y Azure todos fallan → return sin playback, estado IDLE."""
         patched_assistant._whisper_stt.transcribe.return_value = "abrí chrome"
         patched_assistant._opencode.send_command.return_value = "[STYLE: cheerful] Listo"
-        patched_assistant._piper_tts.synthesize.side_effect = RuntimeError("Piper falló")
+        patched_assistant._local_tts.synthesize.side_effect = RuntimeError("Piper falló")
         patched_assistant._gemini_tts.synthesize.side_effect = RuntimeError("Gemini falló")
         patched_assistant._azure_tts = None
 
