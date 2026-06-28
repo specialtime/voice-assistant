@@ -60,12 +60,36 @@ foreach ($item in $toCopy) {
     Write-Host "[OK] Copiado: $item"
 }
 
+# Crear/actualizar venv en prod (Python 3.10 requerido por kokoro-onnx/piper-tts)
+$venvPython = "$PROD_DIR\.venv\Scripts\python.exe"
+if (-not (Test-Path -LiteralPath $venvPython)) {
+    Write-Host "[INFO] Creando venv en prod (Python 3.10)..."
+    & py -3.10 -m venv "$PROD_DIR\.venv"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[ERROR] No se pudo crear el venv. Verificá que Python 3.10 esté instalado: py -0p"
+        exit 1
+    }
+    Write-Host "[OK] venv creado en $PROD_DIR\.venv"
+}
+
+# Instalar/actualizar deps en el venv de prod
+Write-Host "[INFO] Instalando dependencias en venv de prod..."
+& $venvPython -m pip install --upgrade pip 2>&1 | Out-Null
+& $venvPython -m pip install -r "$PROD_DIR\requirements.txt" 2>&1 | ForEach-Object { Write-Host "  $_" }
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[ERROR] Falló la instalación de dependencias. Revisá requirements.txt."
+    exit 1
+}
+Write-Host "[OK] Dependencias instaladas en venv de prod"
+
 # Limpiar __pycache__ en prod (post-copia)
 Get-ChildItem -Path $PROD_DIR -Recurse -Directory -Filter "__pycache__" -ErrorAction SilentlyContinue |
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Host ""
 Write-Host "[OK] Deploy completado."
-Write-Host "[INFO] Si requirements.txt cambió, ejecutá: pip install -r requirements.txt"
+Write-Host "[INFO] venv y dependencias actualizados automáticamente en $PROD_DIR\.venv"
 Write-Host "[INFO] NO se copió config\settings.json — si el código necesita un nuevo campo,"
 Write-Host "       agregalo manualmente a $PROD_DIR\config\settings.json"
+Write-Host "[INFO] NO se copiaron modelos locales (Whisper/Piper/Kokoro) — están en .gitignore."
+Write-Host "       Si prod no los tiene, descargá los de Kokoro manualmente (ver README)."
