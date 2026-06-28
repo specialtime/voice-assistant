@@ -8,6 +8,26 @@ No requiere API key ni conexión a internet (tras descarga inicial del modelo).
 import logging
 import os
 
+# Registrar DLLs de CUDA (cuBLAS, cuDNN, cuDNN) para ctranslate2 en Windows.
+# Estas libs se instalan via pip (nvidia-cublas-cu12, nvidia-cudnn-cu12) pero
+# Windows no las encuentra automaticamente porque estan en subdirectorios
+# de site-packages/nvidia/. os.add_dll_directory() las hace visibles a
+# LoadLibraryEx que usa ctranslate2 internamente.
+# Si las libs no estan instaladas (CPU-only), el registro se omite silenciosamente
+# y faster_whisper intentara cargar normalmente (fallando con su mensaje habitual).
+try:
+    import nvidia
+    _nvidia_base = list(nvidia.__path__)[0]
+    for _lib_name in ("cublas", "cudnn", "cuda_nvrtc"):
+        _bin_dir = os.path.join(_nvidia_base, _lib_name, "bin")
+        if os.path.isdir(_bin_dir):
+            os.add_dll_directory(_bin_dir)
+            # Tambien agregar al PATH: ctranslate2 usa LoadLibraryEx que en algunos
+            # casos consulta PATH ademas de los directorios registrados.
+            os.environ["PATH"] = _bin_dir + os.pathsep + os.environ.get("PATH", "")
+except (ImportError, OSError):
+    pass  # nvidia-* no instalado o path invalido — CPU fallback
+
 from faster_whisper import WhisperModel
 
 logger = logging.getLogger(__name__)
