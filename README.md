@@ -266,10 +266,13 @@ scripts\start_cortex.bat
 
 ### 7. Verificar funcionamiento
 
-1. Presionar `Alt+V` → debe aparecer chip "● Grabando..." abajo al centro.
+1. Presionar `Alt+V` → debe aparecer chip "● Grabando..." (rojo, pulsante) abajo al centro.
 2. Hablar un comando (ej: "abrí Chrome").
-3. Presionar `Alt+V` de nuevo → chip cambia a "● Procesando...".
-4. Escuchar la respuesta de voz.
+3. Presionar `Alt+V` de nuevo → chip cambia a "● Procesando..." (amarillo). Permanece en amarillo durante toda la fase de STT + razonamiento del agente + síntesis TTS.
+4. Cuando el audio empieza a sonar realmente → chip cambia a "● Hablando..." (verde). La transición a verde ocurre **solo al primer chunk PCM real** del playback, no antes.
+5. Al terminar la respuesta → chip desaparece (vuelve a idle).
+
+> **Nota:** Si el streaming falla y cae al flujo síncrono (fallback), el comportamiento del overlay es equivalente: amarillo durante procesamiento, verde al iniciar playback.
 
 ---
 
