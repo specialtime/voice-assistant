@@ -152,7 +152,7 @@ class AudioManager:
           El callback mantiene un buffer interno np.array que ACUMULA samples de
           múltiples chunks. En cada invocación consume `frames` samples del frente.
           Underrun real (cola vacía + buffer insuficiente) → silencio.
-        - Bloquea hasta que el stream se agota Y el playback termina (o timeout 30s).
+        - Bloquea hasta que el stream se agota Y el playback termina (o timeout dinámico con safety net).
 
         Args:
             pcm_stream: Iterator que yields bytes PCM s16le (raw, sin cabecera).
@@ -207,6 +207,7 @@ class AudioManager:
             return
         with self._playback_lock:
             self._playback_stream = stream
+        _total_samples_pushed = 0
         try:
             for chunk in pcm_stream:
                 if self._stop_playback_event.is_set():  # NUEVO — chequear interrupción
@@ -214,6 +215,7 @@ class AudioManager:
                     break
                 try:
                     q.put(chunk, timeout=2.0)  # bloquea hasta 2s esperando espacio
+                    _total_samples_pushed += len(np.frombuffer(chunk, dtype=np.int16))
                 except queue.Full:
                     logger.error("Audio stream: callback no consume — cerrando stream")
                     break  # el finally manda sentinel
@@ -221,15 +223,26 @@ class AudioManager:
             logger.exception("Productor stream falló")
         finally:
             q.put(_SENTINEL)  # GARANTIZAR sentinel
-        # Timeout anti-deadlock residual: esperar a que el callback
-        # reciba el sentinel y levante CallbackStop (máx 30s).
-        # Nota: sd.OutputStream no tiene .wait(); se usa polling de
-        # .active con timeout, funcionalmente equivalente al diseño.
-        _deadline = _time.time() + 30
-        while stream.active and _time.time() < _deadline:
+        # Timeout dinámico anti-deadlock: el callback consume a tiempo
+        # real de audio, no a velocidad de red. Estimar duración real del
+        # playback y darle margen. Safety net superior configurable para
+        # evitar espera infinita si el callback se clava.
+        _estimated_duration = _total_samples_pushed / sample_rate
+        _safety_net = self._settings.get("audio", {}).get("streaming_playback_safety_net_seconds", 600)
+        _start_wait = _time.time()
+        _deadline = _start_wait + _estimated_duration * 1.3 + 10.0
+        _capped_deadline = min(_deadline, _start_wait + _safety_net)
+        logger.debug(
+            "Streaming playback: deadline dinámico %.1fs (estimado %.1fs + margen, safety_net %ss)",
+            _capped_deadline - _start_wait, _estimated_duration, _safety_net,
+        )
+        while stream.active and _time.time() < _capped_deadline:
             _time.sleep(0.05)
         if stream.active:
-            logger.warning("Streaming playback timeout — forzando stop tras 30s")
+            logger.warning(
+                "Streaming playback timeout — forzando stop tras %.1fs",
+                _time.time() - _start_wait,
+            )
         with self._playback_lock:  # limpiar ref
             self._playback_stream = None
         # FIX-2 @security: try/except — stop_playback() puede haber cerrado el stream ya
