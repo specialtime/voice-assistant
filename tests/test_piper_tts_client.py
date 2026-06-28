@@ -1,6 +1,6 @@
 """Tests unitarios para PiperTTSClient.
 
-Mockea piper.PiperVoice y piper.download.ensure_voice_exists.
+Mockea PiperVoice, download_voice y Path.exists.
 Sin red, sin disco, sin modelo real.
 """
 
@@ -8,6 +8,7 @@ import io
 import logging
 import os
 import wave
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -30,7 +31,7 @@ def piper_settings() -> dict:
     }
 
 
-def _fake_synthesize(wav_file, text_list, length_scale=1.0):
+def _fake_synthesize_wav(text, wav_file, syn_config=None):
     """Helper: escribe un WAV válido mínimo en el buffer.
 
     Cabecera de 44 bytes + 200 bytes PCM (100 samples s16le).
@@ -49,10 +50,10 @@ def _fake_synthesize(wav_file, text_list, length_scale=1.0):
 @pytest.mark.unit
 def test_synthesize_success(piper_settings):
     """synthesize() retorna PCM crudo (sin cabecera WAV)."""
-    with patch("handlers.piper_tts_client.piper.PiperVoice") as mock_voice_cls, \
-         patch("handlers.piper_tts_client.os.path.exists", return_value=True):
+    with patch("handlers.piper_tts_client.PiperVoice") as mock_voice_cls, \
+         patch("handlers.piper_tts_client.Path.exists", return_value=True):
         mock_voice = MagicMock()
-        mock_voice.synthesize.side_effect = _fake_synthesize
+        mock_voice.synthesize_wav.side_effect = _fake_synthesize_wav
         mock_voice_cls.load.return_value = mock_voice
 
         client = PiperTTSClient(piper_settings)
@@ -67,10 +68,10 @@ def test_synthesize_success(piper_settings):
 @pytest.mark.unit
 def test_synthesize_lazy_load(piper_settings):
     """La voz NO se carga en __init__, sí en la 1ra llamada a synthesize()."""
-    with patch("handlers.piper_tts_client.piper.PiperVoice") as mock_voice_cls, \
-         patch("handlers.piper_tts_client.os.path.exists", return_value=True):
+    with patch("handlers.piper_tts_client.PiperVoice") as mock_voice_cls, \
+         patch("handlers.piper_tts_client.Path.exists", return_value=True):
         mock_voice = MagicMock()
-        mock_voice.synthesize.side_effect = _fake_synthesize
+        mock_voice.synthesize_wav.side_effect = _fake_synthesize_wav
         mock_voice_cls.load.return_value = mock_voice
 
         # __init__ no debe llamar a load
@@ -84,34 +85,33 @@ def test_synthesize_lazy_load(piper_settings):
 
 @pytest.mark.unit
 def test_synthesize_downloads_voice_if_missing(piper_settings):
-    """Si el ONNX no existe, ensure_voice_exists es llamado."""
-    with patch("handlers.piper_tts_client.piper.PiperVoice") as mock_voice_cls, \
-         patch("handlers.piper_tts_client.os.path.exists", return_value=False), \
-         patch("handlers.piper_tts_client.ensure_voice_exists") as mock_download:
+    """Si el ONNX no existe, download_voice es llamado."""
+    with patch("handlers.piper_tts_client.PiperVoice") as mock_voice_cls, \
+         patch("handlers.piper_tts_client.Path.exists", return_value=False), \
+         patch("handlers.piper_tts_client.Path.mkdir") as mock_mkdir, \
+         patch("handlers.piper_tts_client.download_voice") as mock_download:
         mock_voice = MagicMock()
-        mock_voice.synthesize.side_effect = _fake_synthesize
+        mock_voice.synthesize_wav.side_effect = _fake_synthesize_wav
         mock_voice_cls.load.return_value = mock_voice
 
         client = PiperTTSClient(piper_settings)
         client.synthesize("Hola")
 
         mock_download.assert_called_once()
-        # Verificar que se pasaron los argumentos correctos
-        call_kwargs = mock_download.call_args.kwargs
-        assert call_kwargs["lang"] == "es"
-        assert call_kwargs["lang_locale"] == "es_AR"
-        assert call_kwargs["speaker"] == "daniela"
-        assert call_kwargs["quality"] == "high"
+        # download_voice(voice_model, voices_dir) con Path
+        call_args = mock_download.call_args[0]
+        assert call_args[0] == "es_AR-daniela-high"
+        assert call_args[1] == Path("models/piper-voices")
 
 
 @pytest.mark.unit
 def test_synthesize_no_download_if_exists(piper_settings):
-    """Si el ONNX ya existe, ensure_voice_exists NO es llamado."""
-    with patch("handlers.piper_tts_client.piper.PiperVoice") as mock_voice_cls, \
-         patch("handlers.piper_tts_client.os.path.exists", return_value=True), \
-         patch("handlers.piper_tts_client.ensure_voice_exists") as mock_download:
+    """Si el ONNX ya existe, download_voice NO es llamado."""
+    with patch("handlers.piper_tts_client.PiperVoice") as mock_voice_cls, \
+         patch("handlers.piper_tts_client.Path.exists", return_value=True), \
+         patch("handlers.piper_tts_client.download_voice") as mock_download:
         mock_voice = MagicMock()
-        mock_voice.synthesize.side_effect = _fake_synthesize
+        mock_voice.synthesize_wav.side_effect = _fake_synthesize_wav
         mock_voice_cls.load.return_value = mock_voice
 
         client = PiperTTSClient(piper_settings)
@@ -122,11 +122,11 @@ def test_synthesize_no_download_if_exists(piper_settings):
 
 @pytest.mark.unit
 def test_synthesize_failure(piper_settings):
-    """Si PiperVoice.synthesize lanza excepción → RuntimeError."""
-    with patch("handlers.piper_tts_client.piper.PiperVoice") as mock_voice_cls, \
-         patch("handlers.piper_tts_client.os.path.exists", return_value=True):
+    """Si PiperVoice.synthesize_wav lanza excepción → RuntimeError."""
+    with patch("handlers.piper_tts_client.PiperVoice") as mock_voice_cls, \
+         patch("handlers.piper_tts_client.Path.exists", return_value=True):
         mock_voice = MagicMock()
-        mock_voice.synthesize.side_effect = RuntimeError("modelo roto")
+        mock_voice.synthesize_wav.side_effect = RuntimeError("modelo roto")
         mock_voice_cls.load.return_value = mock_voice
 
         client = PiperTTSClient(piper_settings)
@@ -137,10 +137,10 @@ def test_synthesize_failure(piper_settings):
 @pytest.mark.unit
 def test_synthesize_stream_chunks(piper_settings):
     """synthesize_stream() yields chunks de hasta 4096 bytes PCM."""
-    with patch("handlers.piper_tts_client.piper.PiperVoice") as mock_voice_cls, \
-         patch("handlers.piper_tts_client.os.path.exists", return_value=True):
+    with patch("handlers.piper_tts_client.PiperVoice") as mock_voice_cls, \
+         patch("handlers.piper_tts_client.Path.exists", return_value=True):
         mock_voice = MagicMock()
-        mock_voice.synthesize.side_effect = _fake_synthesize
+        mock_voice.synthesize_wav.side_effect = _fake_synthesize_wav
         mock_voice_cls.load.return_value = mock_voice
 
         client = PiperTTSClient(piper_settings)
@@ -158,10 +158,10 @@ def test_synthesize_stream_chunks(piper_settings):
 @pytest.mark.unit
 def test_style_hint_ignored(piper_settings):
     """synthesize(text, 'cheerful') produce el mismo resultado que synthesize(text, '')."""
-    with patch("handlers.piper_tts_client.piper.PiperVoice") as mock_voice_cls, \
-         patch("handlers.piper_tts_client.os.path.exists", return_value=True):
+    with patch("handlers.piper_tts_client.PiperVoice") as mock_voice_cls, \
+         patch("handlers.piper_tts_client.Path.exists", return_value=True):
         mock_voice = MagicMock()
-        mock_voice.synthesize.side_effect = _fake_synthesize
+        mock_voice.synthesize_wav.side_effect = _fake_synthesize_wav
         mock_voice_cls.load.return_value = mock_voice
 
         client = PiperTTSClient(piper_settings)
@@ -174,10 +174,10 @@ def test_style_hint_ignored(piper_settings):
 @pytest.mark.unit
 def test_returns_pcm_not_wav(piper_settings):
     """El resultado NO empieza con 'RIFF' (cabecera WAV), es PCM crudo."""
-    with patch("handlers.piper_tts_client.piper.PiperVoice") as mock_voice_cls, \
-         patch("handlers.piper_tts_client.os.path.exists", return_value=True):
+    with patch("handlers.piper_tts_client.PiperVoice") as mock_voice_cls, \
+         patch("handlers.piper_tts_client.Path.exists", return_value=True):
         mock_voice = MagicMock()
-        mock_voice.synthesize.side_effect = _fake_synthesize
+        mock_voice.synthesize_wav.side_effect = _fake_synthesize_wav
         mock_voice_cls.load.return_value = mock_voice
 
         client = PiperTTSClient(piper_settings)
@@ -189,9 +189,10 @@ def test_returns_pcm_not_wav(piper_settings):
 
 
 @pytest.mark.unit
-@patch("handlers.piper_tts_client.piper.PiperVoice")
-@patch("handlers.piper_tts_client.ensure_voice_exists")
-def test_no_secrets_logged(mock_ensure, mock_voice_cls, piper_settings, caplog):
+@patch("handlers.piper_tts_client.PiperVoice")
+@patch("handlers.piper_tts_client.download_voice")
+@patch("handlers.piper_tts_client.Path.mkdir")
+def test_no_secrets_logged(mock_mkdir, mock_download, mock_voice_cls, piper_settings, caplog):
     """Paths absolutos del usuario NO deben aparecer en logs de PiperTTSClient."""
     # Configurar voices_dir con un path "sensible"
     piper_settings["local"]["piper"]["voices_dir"] = "C:\\Users\\SECRET_USER_DO_NOT_LEAK_999\\models"
@@ -200,13 +201,13 @@ def test_no_secrets_logged(mock_ensure, mock_voice_cls, piper_settings, caplog):
     mock_voice_inst = MagicMock()
     mock_voice_cls.load.return_value = mock_voice_inst
 
-    def fake_synthesize(wav_file, text_list, length_scale=1.0):
+    def fake_synthesize_wav(text, wav_file, syn_config=None):
         wav_file.setnchannels(1)
         wav_file.setsampwidth(2)
         wav_file.setframerate(24000)
         wav_file.writeframes(b"\x00\x01" * 100)
 
-    mock_voice_inst.synthesize.side_effect = fake_synthesize
+    mock_voice_inst.synthesize_wav.side_effect = fake_synthesize_wav
 
     with caplog.at_level(logging.DEBUG, logger="handlers.piper_tts_client"):
         client = PiperTTSClient(piper_settings)

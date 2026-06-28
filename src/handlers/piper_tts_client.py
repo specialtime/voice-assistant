@@ -9,14 +9,16 @@ import io
 import logging
 import os
 import wave
+from pathlib import Path
 from typing import Iterator
 
-import piper
-from piper.download import ensure_voice_exists
+from piper import PiperVoice, SynthesisConfig
+from piper.download_voices import download_voice
 
 logger = logging.getLogger(__name__)
 
 _WAV_HEADER_SIZE = 44  # Cabecera WAV estándar (PCM s16le)
+_PIPER_VOICES_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0"
 
 
 class PiperTTSClient:
@@ -33,7 +35,7 @@ class PiperTTSClient:
             settings: Dict completo de settings.json (usa settings['local']['piper']).
         """
         self.settings = settings
-        self._voice: "piper.PiperVoice | None" = None  # lazy-load
+        self._voice: PiperVoice | None = None  # lazy-load
 
         cfg = settings["local"]["piper"]
         logger.debug(
@@ -46,36 +48,23 @@ class PiperTTSClient:
         if self._voice is not None:
             return
         cfg = self.settings["local"]["piper"]
-        voices_dir = cfg["voices_dir"]
+        voices_dir = Path(cfg["voices_dir"])
         voice_model = cfg["voice_model"]
 
-        # Construir rutas esperadas
-        # voice_model = "es_AR-daniela-high" → lang=es, locale=es_AR, speaker=daniela, quality=high
-        parts = voice_model.split("-")  # ["es_AR", "daniela", "high"]
-        lang_locale = parts[0]  # es_AR
-        lang = lang_locale.split("_")[0]  # es
-        speaker = parts[1]  # daniela
-        quality = parts[2]  # high
-
-        onnx_path = os.path.join(voices_dir, lang, lang_locale, speaker, quality, f"{voice_model}.onnx")
-        json_path = onnx_path + ".json"
+        # Rutas: download_voice descarga {voice}.onnx y {voice}.onnx.json directo a voices_dir
+        onnx_path = voices_dir / f"{voice_model}.onnx"
+        json_path = voices_dir / f"{voice_model}.onnx.json"
 
         # Descargar si no existe
-        if not os.path.exists(onnx_path):
+        if not onnx_path.exists():
             logger.info("Descargando voz Piper — voice=%s...", voice_model)
-            ensure_voice_exists(
-                voices_dir,
-                download_url_base="https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0",
-                lang=lang,
-                lang_locale=lang_locale,
-                speaker=speaker,
-                quality=quality,
-            )
+            voices_dir.mkdir(parents=True, exist_ok=True)
+            download_voice(voice_model, voices_dir)
             logger.info("Voz Piper descargada OK")
 
         # Cargar modelo
         logger.info("Cargando voz Piper local — voice=%s...", voice_model)
-        self._voice = piper.PiperVoice.load(onnx_path, config_path=json_path)
+        self._voice = PiperVoice.load(str(onnx_path), config_path=str(json_path))
         logger.info("Voz Piper cargada OK")
 
     def synthesize(self, text: str, style_hint: str = "") -> bytes:
@@ -98,10 +87,14 @@ class PiperTTSClient:
 
         cfg = self.settings["local"]["piper"]
         try:
-            # Piper sintetiza a un stream de bytes WAV
+            # Piper sintetiza a un buffer WAV via synthesize_wav
             buffer = io.BytesIO()
             with wave.open(buffer, "wb") as wav_file:
-                self._voice.synthesize(wav_file, [text], length_scale=cfg["length_scale"])
+                self._voice.synthesize_wav(
+                    text,
+                    wav_file,
+                    syn_config=SynthesisConfig(length_scale=cfg["length_scale"]),
+                )
             wav_bytes = buffer.getvalue()
         except Exception as exc:
             logger.error("Piper TTS falló — %s: %s", type(exc).__name__, exc)
