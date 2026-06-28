@@ -57,7 +57,7 @@ for _p in (str(_SRC), str(_PROJECT_ROOT)):
 #
 # Los handlers ``whisper_stt_client`` y ``piper_tts_client`` hacen
 # ``from faster_whisper import WhisperModel`` y ``import piper`` /
-# ``from piper.download import ensure_voice_exists`` en el top-level
+# ``from piper.download_voices import download_voice`` en el top-level
 # del módulo. Si las wheels reales no están instaladas, esos imports
 # rompen toda la colección de pytest ANTES de que el body del test
 # corra.
@@ -82,12 +82,13 @@ def _ensure_stub_modules() -> None:
     if "piper" not in sys.modules:
         piper_stub = types.ModuleType("piper")
         piper_stub.PiperVoice = MagicMock(name="PiperVoice")
-        # piper.download es submódulo
-        piper_download_stub = types.ModuleType("piper.download")
-        piper_download_stub.ensure_voice_exists = MagicMock(name="ensure_voice_exists")
-        piper_stub.download = piper_download_stub
+        piper_stub.SynthesisConfig = MagicMock(name="SynthesisConfig")
+        # piper.download_voices es submódulo (API real de piper-tts 1.4.2)
+        piper_download_stub = types.ModuleType("piper.download_voices")
+        piper_download_stub.download_voice = MagicMock(name="download_voice")
+        piper_stub.download_voices = piper_download_stub
         sys.modules["piper"] = piper_stub
-        sys.modules["piper.download"] = piper_download_stub
+        sys.modules["piper.download_voices"] = piper_download_stub
 
 
 _ensure_stub_modules()
