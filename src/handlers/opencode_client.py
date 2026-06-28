@@ -7,7 +7,8 @@ y failover entre el modelo default del agente (frontmatter) y un modelo fallback
 
 import json
 import logging
-from typing import Iterator, List, Optional
+import time
+from typing import Iterator, List, Optional, Tuple
 
 import httpx
 
@@ -319,6 +320,8 @@ class OpenCodeClient:
         # --- Paso 3-7: Leer stream SSE ---
         delta_count = 0
         first_delta_logged = False
+        streaming_timeout = self.settings.get("opencode", {}).get("streaming_timeout_seconds", 120)
+        start_time = time.monotonic()
         try:
             with self._client.stream("GET", "/event") as stream_response:
                 stream_response.raise_for_status()
@@ -329,14 +332,18 @@ class OpenCodeClient:
                     if line == "":
                         # Línea vacía → fin de evento SSE
                         if data_buffer:
-                            for delta in self._process_sse_event(
+                            deltas, done = self._process_sse_event(
                                 data_buffer, session_id
-                            ):
+                            )
+                            for delta in deltas:
                                 if not first_delta_logged:
                                     logger.debug("Primer delta recibido: %r", delta)
                                     first_delta_logged = True
                                 delta_count += 1
                                 yield delta
+                            if done:
+                                logger.debug("session.idle recibido — cerrando stream SSE")
+                                break
                             data_buffer = ""
                         continue
 
@@ -344,9 +351,18 @@ class OpenCodeClient:
                         data_buffer += line[6:]  # acumular JSON sin prefijo
                     # Ignorar otras líneas (event:, id:, comentarios :)
 
+                    # Timeout absoluto del stream
+                    if time.monotonic() - start_time > streaming_timeout:
+                        logger.warning(
+                            "Stream SSE excedió timeout de %ds — cerrando",
+                            streaming_timeout,
+                        )
+                        break
+
                 # Fin del stream: procesar cualquier evento residual
                 if data_buffer:
-                    for delta in self._process_sse_event(data_buffer, session_id):
+                    deltas, done = self._process_sse_event(data_buffer, session_id)
+                    for delta in deltas:
                         if not first_delta_logged:
                             logger.debug("Primer delta recibido: %r", delta)
                             first_delta_logged = True
@@ -376,16 +392,17 @@ class OpenCodeClient:
             delta_count,
         )
 
-    def _process_sse_event(self, data_str: str, session_id: str) -> list:
+    def _process_sse_event(self, data_str: str, session_id: str) -> Tuple[List[str], bool]:
         """Procesa un evento SSE completo: parsea JSON, filtra por sessionID,
-        y retorna lista de deltas o lanza error según el tipo de evento.
+        y retorna tupla (deltas, done) o lanza error según el tipo de evento.
 
         Args:
             data_str: String JSON del campo `data:` del evento SSE.
             session_id: ID de sesión esperado para filtrar eventos.
 
         Returns:
-            Lista de deltas de texto (puede ser vacía).
+            Tupla (deltas, done): deltas es lista de strings, done es True si
+            el evento señaliza fin del stream (session.idle).
 
         Raises:
             RuntimeError: si el evento es session.error.
@@ -394,28 +411,29 @@ class OpenCodeClient:
             event = json.loads(data_str)
         except json.JSONDecodeError as exc:
             logger.warning("Evento SSE con JSON inválido: %s", exc)
-            return []
+            return [], False
 
         event_type = event.get("type", "")
         properties = event.get("properties", {})
 
         # Filtrar por sessionID
         if properties.get("sessionID") != session_id:
-            return []
+            return [], False
 
         if event_type == "session.next.text.delta":
             delta = properties.get("delta", "")
             if delta:
-                return [delta]
+                return [delta], False
+            return [], False
         elif event_type == "session.idle":
-            # Fin normal del stream
-            return []
+            # Fin normal del stream — señalizar terminación
+            return [], True
         elif event_type == "session.error":
             error_msg = properties.get("error", "error desconocido")
             logger.error("Agente reportó error: %s", error_msg)
             raise RuntimeError(f"Agente error: {error_msg}")
 
-        return []
+        return [], False
 
     def reset_session(self) -> None:
         """Reinicia la sesión limpiando el session_id cacheado en RAM.

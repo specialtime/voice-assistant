@@ -229,12 +229,16 @@ class VoiceAssistant:
 
             if self._streaming_enabled and self._local_tts is not None and hasattr(self._local_tts, 'synthesize_sentence_stream'):
                 # ── Flujo streaming ──
+                prompt_async_sent = False
                 try:
                     with self._send_lock:
                         if self._pipeline_generation != generation:
                             logger.info("Pipeline (gen=%d) cancelado mientras esperaba send_lock", generation)
                             return
+                        # send_command_stream envía prompt_async internamente.
+                        # Si falla antes de enviar, prompt_async_sent queda False.
                         delta_stream = self._opencode.send_command_stream(text)
+                        prompt_async_sent = True  # prompt_async fue aceptado (204)
 
                         # 3+4. Transición a SPEAKING antes del primer audio
                         with self._lock:
@@ -265,9 +269,22 @@ class VoiceAssistant:
                         logger.debug("Streaming pipeline completado (gen=%d)", generation)
 
                 except Exception as e:
-                    logger.warning("Streaming falló (%s: %s), fallback a síncrono", type(e).__name__, e)
-                    # Fallback al flujo síncrono
-                    self._run_sync_pipeline(text, generation)
+                    if prompt_async_sent:
+                        # El agente ya recibió el comando. No reenviar.
+                        logger.warning(
+                            "Streaming falló tras prompt_async (%s: %s). "
+                            "El agente ya está procesando — no se reenvía el comando.",
+                            type(e).__name__, e
+                        )
+                        # Si ya estábamos en SPEAKING, el playback parcial ya ocurrió.
+                        # No hacer fallback síncrono para evitar doble playback.
+                    else:
+                        # prompt_async falló antes de enviar — fallback síncrono seguro.
+                        logger.warning(
+                            "Streaming falló antes de prompt_async (%s: %s), fallback a síncrono",
+                            type(e).__name__, e
+                        )
+                        self._run_sync_pipeline(text, generation)
             else:
                 # ── Flujo síncrono (no streaming) ──
                 self._run_sync_pipeline(text, generation)

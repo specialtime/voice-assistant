@@ -16,6 +16,9 @@ _STYLE_PATTERN = re.compile(r"^\[STYLE:\s*(\w+)\]\s*")
 # Split después de puntuación fuerte (preserva signo en chunk anterior)
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?;])\s+")
 
+# Límite de seguridad: si el buffer excede este tamaño, se fuerza flush por espacios
+MAX_BUFFER_CHARS = 10000
+
 
 class SentenceBuffer:
     """Acumula deltas de texto y emite oraciones completas.
@@ -44,6 +47,27 @@ class SentenceBuffer:
             Lista de oraciones completas (puede ser vacía).
         """
         self._buffer += delta
+
+        # Safety net: si el buffer excede el límite, forzar flush por espacios
+        if len(self._buffer) > MAX_BUFFER_CHARS:
+            logger.warning(
+                "SentenceBuffer excedió %d chars — forzando flush por espacios",
+                MAX_BUFFER_CHARS,
+            )
+            words = self._buffer.split(" ")
+            sentences = []
+            current = ""
+            for w in words:
+                if current and len(current) + len(w) + 1 > 500:
+                    sentences.append(current.strip())
+                    current = w
+                else:
+                    current = (current + " " + w).strip() if current else w
+            if current:
+                sentences.append(current.strip())
+            self._buffer = ""
+            self._style_parsed = True  # ya no intentar parsear style
+            return sentences
 
         # Parsear [STYLE: ...] del inicio (una sola vez)
         if not self._style_parsed:
