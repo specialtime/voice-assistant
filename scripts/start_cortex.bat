@@ -1,6 +1,16 @@
 @echo off
 cd /d "%~dp0\.."
 
+:: Verificar que el venv existe (Python 3.10 requerido por kokoro-onnx/piper-tts)
+if not exist ".venv\Scripts\pythonw.exe" (
+    echo [ERROR] venv no encontrado en .venv\Scripts\pythonw.exe
+    echo [INFO] Crear el venv con Python 3.10:
+    echo     py -3.10 -m venv .venv
+    echo     .venv\Scripts\pip install -r requirements.txt
+    pause
+    exit /b 1
+)
+
 :: Detectar pythonw.exe
 where pythonw.exe >nul 2>&1
 if %errorlevel% neq 0 (
@@ -18,7 +28,7 @@ timeout /t 5 /nobreak >nul
 
 :: 3. Lanzar orquestador Python (sin consola)
 echo [INFO] Iniciando orquestador Cortex (pythonw.exe)...
-start "" pythonw.exe src\main.py
+start "" ".venv\Scripts\pythonw.exe" src\main.py
 
 :: 4. Dar 3 segundos para que arranque
 timeout /t 3 /nobreak >nul
@@ -27,6 +37,7 @@ timeout /t 3 /nobreak >nul
 tasklist /FI "IMAGENAME eq pythonw.exe" 2>nul | find /I "pythonw.exe" >nul
 if %errorlevel% neq 0 (
     echo [ERROR] Los procesos no arrancaron. Revisá logs\cortex.log y logs\opencode-wrapper.log.
+    echo [INFO] Verificá que el venv tenga las deps: .venv\Scripts\pip install -r requirements.txt
     pause
     exit /b 1
 )
