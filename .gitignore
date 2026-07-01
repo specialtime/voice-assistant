@@ -38,6 +38,7 @@ Thumbs.db
 .coverage
 htmlcov/
 .tox/
+tests/_artifacts/
 
 # --- Modelos locales (Whisper, Piper, Kokoro) ---
 models/
