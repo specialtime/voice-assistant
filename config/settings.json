@@ -21,7 +21,7 @@
     "output_format": "raw-24khz-16bit-mono-pcm"
   },
   "local": {
-    "tts_engine": "piper",
+    "tts_engine": "kokoro",
     "whisper": {
       "model": "small",
       "device": "cuda",

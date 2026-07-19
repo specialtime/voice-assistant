@@ -12,7 +12,7 @@ import os
 import sys
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 import keyboard
 from dotenv import load_dotenv
@@ -260,7 +260,7 @@ class VoiceAssistant:
                             for sentence in sentence_buffer.flush():
                                 yield _strip_markdown(sentence)
 
-                        pcm_stream = self._local_tts.synthesize_sentence_stream(sentence_iterator())
+                        pcm_stream = self._synthesize_sentence_stream_with_fallback(sentence_iterator(), generation)
 
                         def pcm_stream_with_speaking_transition():
                             speaking_set: bool = False
@@ -385,6 +385,82 @@ class VoiceAssistant:
         if pcm_bytes:
             self._audio.play_audio(pcm_bytes)
             logger.debug("Playback completado")
+
+    # ── Fallback TTS streaming ───────────────────────────────────────
+
+    def _synthesize_sentence_stream_with_fallback(
+        self, sentences: Iterator[str], generation: int
+    ) -> Iterator[bytes]:
+        """Itera oraciones y sintetiza cada una con cadena de fallback.
+
+        Por cada oración:
+        1. Intenta TTS local (self._local_tts.synthesize).
+        2. Si falla, intenta Gemini TTS (self._gemini_tts.synthesize) si está
+           configurado y el circuit breaker está cerrado.
+        3. Si Gemini falla o no está, intenta Azure TTS streaming
+           (self._azure_tts.synthesize_stream) consumido a bytes.
+        4. Si todos fallan, loguea error y continúa con la siguiente oración
+           (no aborta el stream completo).
+
+        Chequea self._pipeline_generation != generation antes de cada oración
+        para soportar cancelación cooperativa.
+
+        Args:
+            sentences: Iterator que yields oraciones (str) una a una.
+            generation: Número de generación para cancelación cooperativa.
+
+        Yields:
+            Bytes PCM crudo s16le — un yield por oración sintetizada.
+        """
+        for sentence in sentences:
+            if self._pipeline_generation != generation:
+                logger.info("TTS fallback stream cancelado (gen=%d)", generation)
+                return
+            if not sentence.strip():
+                continue
+            pcm = self._synthesize_one_sentence_with_fallback(sentence)
+            if pcm:
+                yield pcm
+
+    def _synthesize_one_sentence_with_fallback(self, sentence: str) -> Optional[bytes]:
+        """Sintetiza una oración con cadena local → Gemini → Azure.
+
+        Retorna PCM bytes si algún TTS funciona, None si todos fallan.
+        No lanza excepciones — el caller decide qué hacer con None.
+        """
+        # 1. TTS local (Piper o Kokoro)
+        try:
+            return self._local_tts.synthesize(sentence, style_hint="")
+        except Exception as e:
+            logger.warning(
+                "TTS local falló para oración (%s: %s), intentando Gemini",
+                type(e).__name__, e,
+            )
+
+        # 2. Gemini TTS (fallback 1)
+        if self._gemini_tts is not None and self._gemini_tts.is_available():
+            try:
+                return self._gemini_tts.synthesize(sentence, style_hint="")
+            except Exception as e:
+                logger.warning(
+                    "Gemini TTS falló (%s: %s), intentando Azure",
+                    type(e).__name__, e,
+                )
+        elif self._gemini_tts is not None and not self._gemini_tts.is_available():
+            logger.warning("Gemini TTS circuit breaker abierto — saltando a Azure")
+
+        # 3. Azure TTS streaming (fallback 2) — consumir a bytes
+        if self._azure_tts is not None:
+            try:
+                return b"".join(self._azure_tts.synthesize_stream(sentence, style_hint=""))
+            except Exception as e:
+                logger.error(
+                    "Azure TTS falló (%s: %s) — sin más fallbacks para esta oración",
+                    type(e).__name__, e,
+                )
+
+        logger.error("Todos los TTS fallaron para oración: '%s'", sentence[:80])
+        return None
 
     # ── Loop principal ────────────────────────────────────────────
 

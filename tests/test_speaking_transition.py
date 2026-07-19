@@ -140,8 +140,13 @@ class TestSpeakingTransitionWrapper:
         subsiguientes.
 
         Setup:
-            - 3 chunks PCM reales (``b"\\x01" * 100``, etc.) en ``pcm_stream``.
+            - 3 oraciones con puntuación final (3 yields PCM reales).
             - ``play_audio_stream`` consume explícitamente el wrapper pasado.
+
+        Post-fix c115c48: el código ya no llama a ``synthesize_sentence_stream``
+        sino al helper de fallback, que invoca ``_local_tts.synthesize`` por
+        oración. Mockeamos ``synthesize`` con ``side_effect`` que retorna un
+        PCM distinto por oración (3 invocaciones → 3 chunks downstream).
         """
         assistant = _build_assistant(
             env_keys, mock_settings, mock_overlay, monkeypatch, streaming_enabled=True
@@ -152,16 +157,22 @@ class TestSpeakingTransitionWrapper:
         # STT OK
         assistant._whisper_stt.transcribe.return_value = "abrí chrome"
 
-        # OpenCode streaming: deltas sintéticos
+        # OpenCode streaming: deltas sintéticos con 3 oraciones terminadas en "."
         def delta_iter():
             yield "[STYLE: cheerful] Hola. "
             yield "Mundo. "
             yield "Chau. "
         assistant._opencode.send_command_stream.return_value = delta_iter()
 
-        # Kokoro streaming: 3 chunks PCM reales
-        pcm_chunks = [b"\x01" * 100, b"\x02" * 100, b"\x03" * 100]
-        assistant._local_tts.synthesize_sentence_stream.return_value = iter(pcm_chunks)
+        # Post-fix: el helper llama ``_local_tts.synthesize`` por oración.
+        # 3 oraciones → 3 invocaciones → 3 yields PCM (uno por oración).
+        pcm_per_sentence = [b"\x01" * 100, b"\x02" * 100, b"\x03" * 100]
+        pcm_chunks = list(pcm_per_sentence)  # copia: aserción final
+
+        def synth_side_effect(text, style_hint=""):
+            return pcm_per_sentence.pop(0)
+
+        assistant._local_tts.synthesize.side_effect = synth_side_effect
 
         # Capturar estado cuando se llame play_audio_stream (DEBE ser PROCESSING
         # porque la transición no debería haber ocurrido aún)
@@ -294,12 +305,20 @@ class TestSpeakingTransitionWrapper:
     def test_wrapper_skips_empty_initial_chunks(
         self, env_keys, mock_settings, mock_overlay, monkeypatch
     ):
-        """Caso 3: si los primeros chunks son ``b""`` (vacíos), la
-        transición NO se dispara hasta que llegue un chunk no-vacío.
+        """Caso 3: si los primeros yields del helper son ``b""`` (vacíos),
+        la transición NO se dispara hasta que llegue un chunk no-vacío.
 
-        Esto modela el caso real donde ``KokoroTTSClient`` puede emitir
-        chunks vacíos como padding entre oraciones o durante warmup del
-        stream. El wrapper debe ignorarlos y esperar al primer chunk real.
+        Esto modela el caso real donde ``_azure_tts.synthesize_stream`` puede
+        emitir chunks vacíos como padding, o donde ``_local_tts.synthesize``
+        retorne ``b""`` (silencio). El wrapper debe ignorarlos y esperar al
+        primer chunk no-vacío.
+
+        Post-fix c115c48: el helper invoca ``_local_tts.synthesize`` por
+        oración. El propio helper (``_synthesize_sentence_stream_with_fallback``)
+        filtra los ``b""`` (no los yield-ea) — solo se yield-ean los PCM no
+        vacíos. Mockeamos ``synthesize`` con un ``side_effect`` que retorna
+        ``b""`` para las 2 primeras oraciones y PCM real para las 2 últimas.
+        El wrapper debe transicionar a SPEAKING solo al primer chunk no-vacío.
         """
         assistant = _build_assistant(
             env_keys, mock_settings, mock_overlay, monkeypatch, streaming_enabled=True
@@ -308,14 +327,31 @@ class TestSpeakingTransitionWrapper:
 
         assistant._whisper_stt.transcribe.return_value = "abrí chrome"
 
+        # 4 oraciones: 2 vacías (silencio) + 2 reales
         def delta_iter():
-            yield "[STYLE: cheerful] Hola. "
-            yield "Mundo. "
+            yield "[STYLE: cheerful] Primera. "
+            yield "Segunda. "
+            yield "Tercera. "
+            yield "Cuarta. "
         assistant._opencode.send_command_stream.return_value = delta_iter()
 
-        # 2 chunks vacíos seguidos de 2 chunks reales
-        pcm_chunks = [b"", b"", b"\x01" * 100, b"\x02" * 100]
-        assistant._local_tts.synthesize_sentence_stream.return_value = iter(pcm_chunks)
+        # ``_local_tts.synthesize`` retorna ``b""`` para las 2 primeras
+        # oraciones y bytes reales para las 2 últimas. El helper filtra los
+        # ``b""`` (no los yield-ea al wrapper) → solo llegan 2 chunks al
+        # wrapper (los reales).
+        def synth_side_effect(text, style_hint=""):
+            if text in ("Primera.", "Segunda."):
+                return b""  # silencio
+            return {  # oraciones reales
+                "Tercera.": b"\x01" * 100,
+                "Cuarta.": b"\x02" * 100,
+            }[text]
+
+        assistant._local_tts.synthesize.side_effect = synth_side_effect
+
+        # Lo que el wrapper debería emitir downstream: solo los 2 chunks
+        # no-vacíos (el helper filtra los ``b""``).
+        expected_downstream = [b"\x01" * 100, b"\x02" * 100]
 
         # Estado al pasar a play_audio_stream y después del drain
         state_progression = []
@@ -345,9 +381,10 @@ class TestSpeakingTransitionWrapper:
             f"set_state('speaking') debe llamarse 1 vez (solo al primer chunk real), "
             f"se llamó {len(speaking_calls)}: {speaking_calls}"
         )
-        # 4) El wrapper emitió TODOS los chunks downstream (vacíos y reales)
-        assert captured_stream[0] == pcm_chunks, (
-            f"Wrapper debe emitir todos los chunks (vacíos y reales), "
+        # 4) El wrapper emitió SOLO los chunks no-vacíos downstream
+        #    (el helper filtra ``b""`` antes de yield-earlos al wrapper).
+        assert captured_stream[0] == expected_downstream, (
+            f"Wrapper debe emitir solo chunks no-vacíos, "
             f"se obtuvo {captured_stream[0]!r}"
         )
 
