@@ -133,19 +133,30 @@ class AzureTTSClient:
         # Escapar caracteres XML especiales antes de insertar en SSML
         escaped_text = xml.sax.saxutils.escape(text)
 
-        # Wrapper SSML mínimo — sin <mstts:express-as> (requisito §4.7)
-        ssml = (
-            f'<speak version="1.0" '
-            f'xmlns="http://www.w3.org/2001/10/synthesis" '
-            f'xmlns:mstts="https://www.w3.org/2001/mstts" '
-            f'xml:lang="{self.settings["azure"]["locale"]}">\n'
-            f'    <voice name="{self.settings["azure"]["voice"]}">\n'
-            f'        <mstts:express-as style="{style_hint}">\n'
-            f'            {escaped_text}\n'
-            f'        </mstts:express-as>\n'
-            f'    </voice>\n'
-            f'</speak>'
-        )
+        # SSML condicional: si hay style_hint, incluir <mstts:express-as>;
+        # si no, wrapper mínimo (igual que synthesize()) para evitar style="" inválido.
+        if style_hint:
+            ssml = (
+                f'<speak version="1.0" '
+                f'xmlns="http://www.w3.org/2001/10/synthesis" '
+                f'xmlns:mstts="https://www.w3.org/2001/mstts" '
+                f'xml:lang="{self.settings["azure"]["locale"]}">\n'
+                f'    <voice name="{self.settings["azure"]["voice"]}">\n'
+                f'        <mstts:express-as style="{style_hint}">\n'
+                f'            {escaped_text}\n'
+                f'        </mstts:express-as>\n'
+                f'    </voice>\n'
+                f'</speak>'
+            )
+        else:
+            ssml = (
+                f'<speak version="1.0" '
+                f'xml:lang="{self.settings["azure"]["locale"]}">\n'
+                f'    <voice name="{self.settings["azure"]["voice"]}">\n'
+                f'        {escaped_text}\n'
+                f'    </voice>\n'
+                f'</speak>'
+            )
 
         # Log debug del texto (truncado)
         truncated = text[:120] + "..." if len(text) > 120 else text
