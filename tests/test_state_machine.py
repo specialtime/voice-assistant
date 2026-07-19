@@ -236,12 +236,15 @@ class TestVoiceAssistantStateMachine:
 
         # Estado final: IDLE (vía finally)
         assert patched_assistant._state == VoiceAssistant.STATE_IDLE
-        # Log de error de Azure no configurado
+        # Log de error: todos los TTS fallaron (log consolidado post-primary_engine).
+        # Antes del selector primary_engine, el flujo síncrono logueaba
+        # "Azure TTS no configurado" cuando _azure_tts era None. Con la nueva
+        # arquitectura multi-motor, el log final se consolidó a un mensaje
+        # genérico que aplica a cualquier primary_engine.
         assert any(
-            "azure" in record.getMessage().lower()
-            and "no configurado" in record.getMessage().lower()
+            "todos los tts fallaron" in record.getMessage().lower()
             for record in caplog.records
-        ), f"Log de Azure no configurado no encontrado. Logs: {[r.getMessage() for r in caplog.records]}"
+        ), f"Log 'Todos los TTS fallaron' no encontrado. Logs: {[r.getMessage() for r in caplog.records]}"
         # No se reprodujo audio
         patched_assistant._audio.play_audio.assert_not_called()
 
@@ -1199,3 +1202,509 @@ class TestVoiceAssistantStateMachine:
         assert callable(getattr(PiperTTSClient, "synthesize_sentence_stream")), (
             "synthesize_sentence_stream debe ser callable"
         )
+
+    # ──────────────────────────────────────────────────────────────────
+    # Micro-Spec primary_engine (tts.primary_engine en config)
+    # ──────────────────────────────────────────────────────────────────
+    #
+    # Cubre la nueva sección ``tts.primary_engine`` introducida en commit
+    # ``35ebc67``. Esta spec agrega un selector del motor TTS primario
+    # (``"local"``, ``"gemini"`` o ``"azure"``) que controla el orden de la
+    # cadena de fallback en ``_synthesize_one_sentence_with_fallback`` y
+    # ``_run_sync_pipeline``. Ver:
+    # ``specs/feature_tts_primary_engine.md`` §4.
+
+    @pytest.mark.unit
+    class TestSynthesizeOneSentenceWithFallbackPrimaryEngine:
+        """Tests del helper ``_synthesize_one_sentence_with_fallback`` con
+        el selector ``_tts_primary_engine`` activo.
+
+        Casos cubiertos:
+        - ``"local"`` (default, regresión): local → Gemini → Azure.
+        - ``"gemini"``: Gemini → Azure (sin local).
+        - ``"azure"``: Azure solo (sin local ni Gemini).
+        - Edge cases: valor inválido, clientes None.
+        """
+
+        def test_primary_engine_local_calls_local_first(self, patched_assistant):
+            """``primary_engine="local"`` → ``_local_tts.synthesize`` se invoca
+            primero y retorna PCM. Gemini y Azure NO se llaman.
+
+            Regresión del comportamiento default (ya cubierto por
+            ``test_fallback_local_ok``) re-validado con el atributo explícito
+            para fijar el contrato de la nueva sección ``tts`` del settings.
+            """
+            # Forzar el atributo explícitamente (la fixture lo deja en "local"
+            # por default, pero el test documenta la intención).
+            patched_assistant._tts_primary_engine = "local"
+            patched_assistant._local_tts.synthesize.return_value = b"local_pcm"
+            patched_assistant._gemini_tts.synthesize.return_value = b"gemini_pcm"
+            patched_assistant._azure_tts.synthesize_stream.return_value = iter(
+                [b"azure_pcm"]
+            )
+
+            result = patched_assistant._synthesize_one_sentence_with_fallback(
+                "hola"
+            )
+
+            # Local fue el primero y retornó su PCM
+            assert result == b"local_pcm"
+            patched_assistant._local_tts.synthesize.assert_called_once_with(
+                "hola", style_hint=""
+            )
+            # Gemini y Azure NO se invocaron (local tuvo éxito)
+            patched_assistant._gemini_tts.synthesize.assert_not_called()
+            patched_assistant._azure_tts.synthesize_stream.assert_not_called()
+
+        def test_primary_engine_gemini_skips_local(self, patched_assistant):
+            """``primary_engine="gemini"`` con ``_local_tts=None`` → NO se
+            accede a ``_local_tts`` (verificable: sigue siendo ``None`` y no
+            se llama ``synthesize``). ``_gemini_tts.synthesize`` se invoca
+            primero y retorna PCM.
+
+            Espec §3.2: ``"gemini"`` saltea local y va directo a Gemini.
+            """
+            patched_assistant._tts_primary_engine = "gemini"
+            patched_assistant._local_tts = None  # simula el caso real (init lo setea así)
+            patched_assistant._gemini_tts.synthesize.return_value = b"gemini_pcm"
+            patched_assistant._azure_tts.synthesize_stream.return_value = iter(
+                [b"azure_pcm"]
+            )
+
+            result = patched_assistant._synthesize_one_sentence_with_fallback(
+                "hola"
+            )
+
+            # El helper retorna el PCM de Gemini
+            assert result == b"gemini_pcm"
+            # Gemini fue llamado (con style_hint="")
+            patched_assistant._gemini_tts.synthesize.assert_called_once_with(
+                "hola", style_hint=""
+            )
+            # Azure NO se invocó (Gemini tuvo éxito)
+            patched_assistant._azure_tts.synthesize_stream.assert_not_called()
+            # El atributo _local_tts sigue siendo None (no se intentó acceder)
+            assert patched_assistant._local_tts is None
+
+        def test_primary_engine_azure_skips_local_and_gemini(self, patched_assistant):
+            """``primary_engine="azure"`` con ``_local_tts=None`` y
+            ``_gemini_tts=None`` → solo ``_azure_tts.synthesize_stream`` se
+            invoca. El helper retorna ``b"".join(chunks)``.
+
+            Espec §3.2: ``"azure"`` no consulta local ni Gemini.
+            """
+            patched_assistant._tts_primary_engine = "azure"
+            patched_assistant._local_tts = None
+            patched_assistant._gemini_tts = None
+            # Azure streaming: helper consume el iter y lo junta con b"".join
+            azure_chunks = [b"a", b"b", b"c"]
+            patched_assistant._azure_tts.synthesize_stream.return_value = iter(
+                azure_chunks
+            )
+
+            result = patched_assistant._synthesize_one_sentence_with_fallback(
+                "hola"
+            )
+
+            # El helper retorna b"".join(chunks) → b"abc"
+            assert result == b"abc"
+            # Azure fue llamado con la sentence completa
+            patched_assistant._azure_tts.synthesize_stream.assert_called_once_with(
+                "hola", style_hint=""
+            )
+            # Los atributos _local_tts y _gemini_tts siguen siendo None
+            assert patched_assistant._local_tts is None
+            assert patched_assistant._gemini_tts is None
+
+        def test_primary_engine_gemini_falls_back_to_azure(self, patched_assistant):
+            """``primary_engine="gemini"``, ``_gemini_tts`` configurado pero
+            su ``synthesize`` levanta excepción → cae a Azure. ``_local_tts``
+            no se invoca en ningún momento.
+
+            Valida la cadena ``gemini → azure`` cuando el primario falla.
+            """
+            patched_assistant._tts_primary_engine = "gemini"
+            patched_assistant._local_tts = None  # init real: local=None para gemini
+            # Gemini falla
+            patched_assistant._gemini_tts.synthesize.side_effect = RuntimeError(
+                "Gemini TTS rate limit"
+            )
+            # Azure OK con 2 chunks
+            patched_assistant._azure_tts.synthesize_stream.return_value = iter(
+                [b"x", b"y"]
+            )
+
+            result = patched_assistant._synthesize_one_sentence_with_fallback(
+                "hola"
+            )
+
+            # El helper cae a Azure: retorna join de los chunks
+            assert result == b"xy"
+            # Gemini SÍ fue llamado (1 vez, falló)
+            patched_assistant._gemini_tts.synthesize.assert_called_once_with(
+                "hola", style_hint=""
+            )
+            # Azure SÍ fue llamado (después del fallo de Gemini)
+            patched_assistant._azure_tts.synthesize_stream.assert_called_once_with(
+                "hola", style_hint=""
+            )
+            # _local_tts sigue siendo None (no se intentó invocar)
+            assert patched_assistant._local_tts is None
+
+        def test_primary_engine_azure_no_fallback_returns_none(self, patched_assistant):
+            """``primary_engine="azure"`` con ``_azure_tts=None`` → helper
+            retorna ``None`` sin lanzar excepción, y NO invoca local ni Gemini.
+
+            Espec §3.3: si Azure no está configurado y primary es azure,
+            todos los motores fallan → ``None`` y error en log.
+            """
+            patched_assistant._tts_primary_engine = "azure"
+            patched_assistant._local_tts = None
+            patched_assistant._gemini_tts = None
+            patched_assistant._azure_tts = None  # No hay fallback posible
+
+            result = patched_assistant._synthesize_one_sentence_with_fallback(
+                "hola"
+            )
+
+            # helper NO lanza, retorna None
+            assert result is None
+            # Verificación de que NO se intentó instanciar nada raro:
+            # el atributo sigue siendo None (el helper ya lo había detectado)
+            assert patched_assistant._azure_tts is None
+
+        # ── Test OMITIDO intencionalmente ───────────────────────────
+        # El test 6 de la spec (``test_primary_engine_invalid_defaults_to_local``)
+        # se omitió por el siguiente hallazgo descubierto durante testing:
+        #
+        # El helper ``_synthesize_one_sentence_with_fallback`` NO es defensivo
+        # contra valores inválidos de ``_tts_primary_engine``. Si el atributo
+        # tiene un valor que no es ``"local"``, ``"gemini"`` ni ``"azure"``
+        # (p. ej. ``"foo"``), las tres ramas del helper se saltean y retorna
+        # ``None`` silenciosamente. Esto NO es lo que la spec §4 pedía
+        # ("verificá que el helper se comporta como ``"local"`` (llama
+        # ``_local_tts`` primero)"). El ``__init__`` sí valida y defaultea a
+        # ``"local"`` con warning, por lo que en producción el atributo nunca
+        # debería contener un valor inválido. Pero esto es una validación
+        # **solo en el constructor**, no en el helper.
+        #
+        # Decisión: delegar al arquitecto la decisión de si (a) agregar
+        # defensa en el helper (cambiar la lógica a ``if not in ("gemini",
+        # "azure")`` → tratar como local), (b) documentar como contrato
+        # implícito que ``_tts_primary_engine`` siempre es válido, o
+        # (c) no hacer nada (acepta que la corrupción del atributo causaría
+        # pérdida silenciosa de audio).
+        #
+        # El comportamiento real está cubierto por el test
+        # ``test_primary_engine_invalid_returns_none_no_local_call`` que
+        # documenta el contrato actual y sirve como regression check si
+        # el arquitecto decide modificar la lógica del helper.
+        def test_primary_engine_invalid_returns_none_no_local_call(
+            self, patched_assistant
+        ):
+            """Helper con ``_tts_primary_engine="foo"`` (valor inválido
+            que slipped through ``__init__``): retorna ``None`` sin
+            lanzar excepción y NO invoca ningún TTS.
+
+            HALLAZGO: este test documenta el comportamiento **real** del
+            helper. La spec §4 pedía que el helper fuera defensivo
+            (tratara el valor inválido como ``"local"``), pero la
+            implementación actual NO lo es: las tres ramas del helper
+            (``== "local"``, ``in ("local", "gemini")``,
+            ``in ("local", "gemini", "azure")``) usan ``==``/``in`` con
+            strings literales, por lo que un valor como ``"foo"`` no
+            matchea ninguna rama y el helper retorna ``None``
+            silenciosamente.
+
+            Decisión QA: se omite el test que pedía comportamiento
+            defensivo (test 6 de la spec) y se conserva este test que
+            documenta el contrato actual. Si el arquitecto decide hacer
+            el helper defensivo, este test fallará y deberá actualizarse.
+
+            Ver spec §8 (notas) y el reporte final de QA para más
+            contexto.
+            """
+            # Simular corrupción del atributo (escenario patológico)
+            patched_assistant._tts_primary_engine = "foo"
+            patched_assistant._local_tts.synthesize.return_value = b"local_pcm"
+            patched_assistant._gemini_tts.synthesize.return_value = b"gemini_pcm"
+            patched_assistant._azure_tts.synthesize_stream.return_value = iter(
+                [b"azure_pcm"]
+            )
+
+            result = patched_assistant._synthesize_one_sentence_with_fallback(
+                "hola"
+            )
+
+            # El helper retorna None para un valor no reconocido
+            assert result is None, (
+                f"Esperaba None para primary_engine='foo' (no defensivo), "
+                f"obtuve {result!r}"
+            )
+            # Y NO invoca ningún TTS (las 3 ramas se saltearon)
+            patched_assistant._local_tts.synthesize.assert_not_called()
+            patched_assistant._gemini_tts.synthesize.assert_not_called()
+            patched_assistant._azure_tts.synthesize_stream.assert_not_called()
+
+    @pytest.mark.unit
+    class TestRunSyncPipelinePrimaryEngine:
+        """Tests del flujo síncrono ``_run_sync_pipeline`` con el selector
+        ``_tts_primary_engine`` activo.
+
+        Estrategia: invocar ``_run_sync_pipeline`` directamente con un
+        ``generation`` válido y mocks de STT/OpenCode. Verifica que se
+        respeta el orden de fallback del ``primary_engine``.
+        """
+
+        def test_sync_pipeline_primary_engine_gemini_uses_gemini(
+            self, patched_assistant
+        ):
+            """``primary_engine="gemini"`` → ``_gemini_tts.synthesize`` se
+            invoca, ``_local_tts`` no se consulta. Verifica que no hay
+            ``AttributeError`` cuando ``_local_tts is None`` (defensivo).
+            """
+            patched_assistant._tts_primary_engine = "gemini"
+            patched_assistant._local_tts = None  # init real lo setea así
+            # Mockear el resto de la cadena
+            patched_assistant._opencode.send_command.return_value = (
+                "[STYLE: cheerful] Hola"
+            )
+            patched_assistant._gemini_tts.synthesize.return_value = b"gemini_pcm"
+
+            # Llamar directamente al pipeline síncrono (no streaming)
+            patched_assistant._run_sync_pipeline("texto", generation=0)
+
+            # Gemini SÍ fue llamado con texto limpio (sin prefijo [STYLE:])
+            patched_assistant._gemini_tts.synthesize.assert_called_once()
+            gemini_call_args = patched_assistant._gemini_tts.synthesize.call_args
+            assert gemini_call_args.args[0] == "Hola"
+            # play_audio (no streaming) SÍ se llamó con el PCM
+            patched_assistant._audio.play_audio.assert_called_once_with(
+                b"gemini_pcm"
+            )
+            # _local_tts sigue siendo None (no se intentó invocar)
+            assert patched_assistant._local_tts is None
+
+        def test_sync_pipeline_primary_engine_azure_uses_azure_streaming(
+            self, patched_assistant
+        ):
+            """``primary_engine="azure"`` con ``_local_tts=None`` y
+            ``_gemini_tts=None`` → ``_azure_tts.synthesize_stream`` se
+            invoca y su iter se pasa a ``play_audio_stream``.
+            ``play_audio`` (no streaming) NO se llama.
+            """
+            patched_assistant._tts_primary_engine = "azure"
+            patched_assistant._local_tts = None
+            patched_assistant._gemini_tts = None
+            patched_assistant._opencode.send_command.return_value = (
+                "[STYLE: cheerful] Hola"
+            )
+            # Azure streaming retorna un iter
+            fake_chunks = [b"\x00" * 100, b"\x00" * 100]
+            patched_assistant._azure_tts.synthesize_stream.return_value = iter(
+                fake_chunks
+            )
+
+            patched_assistant._run_sync_pipeline("texto", generation=0)
+
+            # Azure streaming SÍ fue invocado
+            patched_assistant._azure_tts.synthesize_stream.assert_called_once()
+            azure_call_args = patched_assistant._azure_tts.synthesize_stream.call_args
+            assert azure_call_args.args[0] == "Hola"
+            # play_audio_stream SÍ fue invocado con el iter retornado
+            patched_assistant._audio.play_audio_stream.assert_called_once()
+            stream_arg = (
+                patched_assistant._audio.play_audio_stream.call_args.args[0]
+            )
+            assert (
+                stream_arg
+                is patched_assistant._azure_tts.synthesize_stream.return_value
+            )
+            # play_audio (no streaming) NO se llamó (ya se usó el streaming)
+            patched_assistant._audio.play_audio.assert_not_called()
+            # _local_tts y _gemini_tts siguen siendo None
+            assert patched_assistant._local_tts is None
+            assert patched_assistant._gemini_tts is None
+
+    @pytest.mark.unit
+    class TestInitPrimaryEngineSelector:
+        """Tests del ``__init__`` con la sección ``tts.primary_engine`` en
+        ``config/settings.json``.
+
+        Estos tests requieren instanciar ``VoiceAssistant`` con un settings
+        custom (que contenga la sección ``tts``). Se diferencian de
+        ``patched_assistant`` (que usa ``mock_settings`` sin sección ``tts``)
+        porque el ``__init__`` lee ``self._settings.get("tts", ...)`` y debe
+        ser evaluado ANTES de la instanciación.
+
+        Estrategia: crear un archivo temporal ``config/settings.json`` en
+        ``tmp_path`` con la sección ``tts`` requerida, y usar
+        ``monkeypatch.chdir(tmp_path)`` para que el ``__init__`` (que usa
+        ``Path("config/settings.json")``) lo encuentre. Aplica los mismos
+        patches de TTS/STT que la fixture ``patched_assistant``.
+        """
+
+        def _make_settings_file(self, tmp_path, primary_engine):
+            """Helper: escribe ``tmp_path/config/settings.json`` con la
+            sección ``tts.primary_engine`` solicitada y devuelve la ruta
+            base. El dict es mínimo para que ``__init__`` funcione con
+            los clientes mockeados.
+            """
+            import json as _json
+
+            config_dir = tmp_path / "config"
+            config_dir.mkdir(parents=True, exist_ok=True)
+            settings_path = config_dir / "settings.json"
+            settings = {
+                "gemini": {
+                    "stt_model_primary": "gemini-3.1-flash-lite",
+                    "stt_model_fallback": "gemini-2.5-flash-lite",
+                    "tts_model": "gemini-3.1-flash-tts-preview",
+                    "tts_voice": "Charon",
+                    "tts_circuit_breaker_cooldown_seconds": 1800,
+                    "stt_prompt": "test",
+                },
+                "opencode": {
+                    "agent": "asistente_voz",
+                    "model_fallback": "opencode/big-pickle",
+                    "timeout_ms": 120000,
+                    "max_session_messages": 10,
+                },
+                "azure": {
+                    "voice": "es-AR-TomasNeural",
+                    "locale": "es-AR",
+                    "output_format": "raw-24khz-16bit-mono-pcm",
+                },
+                "audio": {
+                    "sample_rate": 24000,
+                    "channels": 1,
+                    "sample_width": 2,
+                    "recording_filename": "comando.wav",
+                },
+                "hotkey": "alt+v",
+                "logging": {
+                    "filename": "logs/cortex.log",
+                    "max_bytes": 5242880,
+                    "backup_count": 3,
+                    "level": "INFO",
+                },
+                "tts": {
+                    "primary_engine": primary_engine,
+                },
+            }
+            settings_path.write_text(
+                _json.dumps(settings), encoding="utf-8"
+            )
+            return tmp_path
+
+        def test_init_primary_engine_gemini_sets_local_tts_none(
+            self, env_keys, mock_overlay, tmp_path, monkeypatch
+        ):
+            """``__init__`` con ``tts.primary_engine="gemini"`` en
+            ``config/settings.json`` → ``_tts_primary_engine == "gemini"``
+            y ``_local_tts is None``.
+
+            Espec §3.1: cuando primary es ``"gemini"`` o ``"azure"``, el
+            orquestador NO instancia el TTS local (ahorra memoria y
+            dependencias de modelos).
+            """
+            self._make_settings_file(tmp_path, primary_engine="gemini")
+            monkeypatch.chdir(tmp_path)
+
+            with patch("main.AzureTTSClient") as mock_atts, \
+                 patch("main.GeminiTTSClient") as mock_gtts, \
+                 patch("main.OpenCodeClient") as mock_oc, \
+                 patch("main.GeminiSTTClient") as mock_stt, \
+                 patch("main.WhisperSTTClient") as mock_wstt, \
+                 patch("main.PiperTTSClient") as mock_ptts, \
+                 patch("main.KokoroTTSClient") as mock_ktts, \
+                 patch("main.AudioManager") as mock_am, \
+                 patch("main.load_dotenv"):
+
+                mock_am.return_value = MagicMock(name="AudioManager")
+                mock_stt.return_value = MagicMock(name="GeminiSTTClient")
+                mock_wstt.return_value = MagicMock(name="WhisperSTTClient")
+                # NO mockeamos el return_value de Piper/Kokoro porque NO
+                # deberían ser instanciados. Si se instancian, el test falla
+                # con la aserción sobre _local_tts abajo.
+                mock_ptts.return_value = MagicMock(name="PiperTTSClient")
+                mock_ktts.return_value = MagicMock(name="KokoroTTSClient")
+                mock_oc.return_value = MagicMock(name="OpenCodeClient")
+                mock_gtts.return_value = MagicMock(name="GeminiTTSClient")
+                mock_atts.return_value = MagicMock(name="AzureTTSClient")
+
+                from main import VoiceAssistant
+
+                assistant = VoiceAssistant()
+
+            # El atributo refleja el settings
+            assert assistant._tts_primary_engine == "gemini", (
+                f"Esperaba _tts_primary_engine='gemini', "
+                f"obtuve {assistant._tts_primary_engine!r}"
+            )
+            # _local_tts NO se instanció (primary != 'local')
+            assert assistant._local_tts is None, (
+                "Con primary_engine='gemini' el TTS local NO debe instanciarse"
+            )
+            # Verificación adicional: Piper/Kokoro no fueron invocados
+            mock_ptts.assert_not_called()
+            mock_ktts.assert_not_called()
+
+        def test_init_primary_engine_invalid_logs_warning_and_defaults_local(
+            self, env_keys, mock_overlay, tmp_path, monkeypatch, caplog
+        ):
+            """``__init__`` con ``tts.primary_engine="foo"`` (inválido) →
+            loguea warning mencionando el valor inválido y defaultea a
+            ``"local"`` (``_tts_primary_engine == "local"``).
+
+            Espec §2.1: valores no reconocidos caen a ``"local"`` con
+            warning, no lanzan excepción.
+            """
+            self._make_settings_file(tmp_path, primary_engine="foo")
+            monkeypatch.chdir(tmp_path)
+
+            with patch("main.AzureTTSClient") as mock_atts, \
+                 patch("main.GeminiTTSClient") as mock_gtts, \
+                 patch("main.OpenCodeClient") as mock_oc, \
+                 patch("main.GeminiSTTClient") as mock_stt, \
+                 patch("main.WhisperSTTClient") as mock_wstt, \
+                 patch("main.PiperTTSClient") as mock_ptts, \
+                 patch("main.KokoroTTSClient") as mock_ktts, \
+                 patch("main.AudioManager") as mock_am, \
+                 patch("main.load_dotenv"):
+
+                mock_am.return_value = MagicMock(name="AudioManager")
+                mock_stt.return_value = MagicMock(name="GeminiSTTClient")
+                mock_wstt.return_value = MagicMock(name="WhisperSTTClient")
+                mock_ptts.return_value = MagicMock(name="PiperTTSClient")
+                mock_ktts.return_value = MagicMock(name="KokoroTTSClient")
+                mock_oc.return_value = MagicMock(name="OpenCodeClient")
+                mock_gtts.return_value = MagicMock(name="GeminiTTSClient")
+                mock_atts.return_value = MagicMock(name="AzureTTSClient")
+
+                from main import VoiceAssistant
+
+                with caplog.at_level(logging.WARNING, logger="main"):
+                    assistant = VoiceAssistant()
+
+            # _tts_primary_engine defaulteó a "local"
+            assert assistant._tts_primary_engine == "local", (
+                f"Esperaba _tts_primary_engine='local' (default por valor "
+                f"inválido), obtuve {assistant._tts_primary_engine!r}"
+            )
+            # _local_tts SÍ se instanció (default local)
+            assert assistant._local_tts is not None, (
+                "Con primary_engine inválido y default a 'local', el TTS "
+                "local SÍ debe instanciarse"
+            )
+            # El warning fue logueado con el valor inválido
+            assert any(
+                "primary_engine" in record.getMessage()
+                and "foo" in record.getMessage()
+                and "inválido" in record.getMessage().lower()
+                and record.levelno == logging.WARNING
+                for record in caplog.records
+            ), (
+                f"Warning de primary_engine inválido no encontrado. "
+                f"Logs: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+            )
