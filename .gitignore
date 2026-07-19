@@ -14,6 +14,7 @@ build/
 .venv/
 venv/
 env/
+scripts/
 
 # --- Logs y runtime ---
 logs/

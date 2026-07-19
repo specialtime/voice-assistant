@@ -10,6 +10,8 @@ Dos procesos separados que se comunican por HTTP:
 
 `src/main.py` es la máquina de estados (`idle`/`recording`/`processing`/`speaking`) y el entrypoint. `src/handlers/` contiene los handlers del pipeline: `audio_manager`, `whisper_stt_client`, `gemini_stt_client`, `opencode_client`, `piper_tts_client`, `kokoro_tts_client`, `gemini_tts_client`, `azure_tts_client`, `response_parser`, `sentence_buffer`, `overlay`.
 
+`specs/` contiene documentos de diseño por feature/bug. Si trabajás en código relacionado con streaming, Kokoro, overlay, o TTS, revisá los specs relevantes primero.
+
 ## Requisito crítico: Python 3.10
 
 `kokoro-onnx` y `piper-tts` no soportan Python 3.13+. **Siempre usar Python 3.10** para el venv:
@@ -23,6 +25,7 @@ py -3.10 -m venv .venv
 ## Configuración
 
 - **`config/settings.json`** es la fuente de verdad para modelos, voces, timeouts, audio, logging y selector de TTS local (`local.tts_engine`: `"piper"` | `"kokoro"`). NO usar env vars para eso.
+- **`tts.primary_engine`** (`"local"` | `"gemini"` | `"azure"`) controla la cadena de fallback TTS. `"local"` → local → Gemini → Azure. `"gemini"` → Gemini → Azure. `"azure"` → solo Azure. Si falta o es inválido, usa `"local"`.
 - **`.env`** solo contiene secrets: `GEMINI_API_KEY`, `AZURE_SPEECH_KEY`, `AZURE_SPEECH_REGION`, `OPENCODE_SERVER_PASSWORD`, `OPENCODE_BASE_URL`. Nunca leer ni commitear `.env`.
 - **Puerto del servidor OpenCode**: `OPENCODE_BASE_URL` env var gana. El default en código (`main.py:77`) es `4096`; `.env.example`, README y scripts usan `57214`. Setear `OPENCODE_BASE_URL` explícitamente para evitar ambigüedad.
 
