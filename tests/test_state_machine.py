@@ -236,12 +236,15 @@ class TestVoiceAssistantStateMachine:
 
         # Estado final: IDLE (vía finally)
         assert patched_assistant._state == VoiceAssistant.STATE_IDLE
-        # Log de error de Azure no configurado
+        # Log de error: todos los TTS fallaron (log consolidado post-primary_engine).
+        # Antes del selector primary_engine, el flujo síncrono logueaba
+        # "Azure TTS no configurado" cuando _azure_tts era None. Con la nueva
+        # arquitectura multi-motor, el log final se consolidó a un mensaje
+        # genérico que aplica a cualquier primary_engine.
         assert any(
-            "azure" in record.getMessage().lower()
-            and "no configurado" in record.getMessage().lower()
+            "todos los tts fallaron" in record.getMessage().lower()
             for record in caplog.records
-        ), f"Log de Azure no configurado no encontrado. Logs: {[r.getMessage() for r in caplog.records]}"
+        ), f"Log 'Todos los TTS fallaron' no encontrado. Logs: {[r.getMessage() for r in caplog.records]}"
         # No se reprodujo audio
         patched_assistant._audio.play_audio.assert_not_called()
 
