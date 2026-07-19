@@ -26,8 +26,6 @@ Asistente de voz en segundo plano para Windows que interactúa con el sistema op
 3. **Razonamiento (streaming):** Texto → OpenCode vía `prompt_async` + stream SSE `/event`. Los tokens del agente se reciben en tiempo real sin esperar la respuesta completa.
 4. **TTS (streaming por oración):** Los deltas de texto se acumulan en un `SentenceBuffer` que emite oraciones completas. Cada oración se sintetiza con Kokoro/Piper y se reproduce vía `play_audio_stream` en tiempo real. Fallback a flujo síncrono (respuesta completa → sintetizar todo → reproducir) si el streaming falla antes de enviar el prompt.
 
-**Por qué proceso usuario (no servicio):** un asistente de voz necesita desktop (overlay tkinter), audio (micrófono/altavoces) y hotkey global. Los servicios de Windows corren en Session 0 (aislada, sin desktop desde Vista) — no pueden mostrar ventanas ni lanzar programas visibles. Correr todo en Session 1 es más simple y funciona correctamente.
-
 ---
 
 ## Estructura del Proyecto
