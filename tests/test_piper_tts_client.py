@@ -217,3 +217,165 @@ def test_no_secrets_logged(mock_mkdir, mock_download, mock_voice_cls, piper_sett
     assert "SECRET_USER_DO_NOT_LEAK_999" not in all_logs, (
         f"Path absoluto filtrado en logs: {[r.getMessage() for r in caplog.records]}"
     )
+
+
+# ──────────────────────────────────────────────────────────────────
+# Tests de synthesize_sentence_stream (Micro-Spec Streaming TTS — T8.bis)
+# ──────────────────────────────────────────────────────────────────
+#
+# Cubre el contrato de ``PiperTTSClient.synthesize_sentence_stream()``
+# introducido en ``fix/streaming-tts-fallback`` (commit c115c48) para
+# permitir que Piper participe del flujo streaming.
+# Análogo a la suite de Kokoro (test_kokoro_tts_client.py:744-862).
+
+
+@pytest.mark.unit
+class TestPiperSynthesizeSentenceStream:
+    """Suite: synthesize_sentence_stream() — yield de PCM por oración."""
+
+    def test_synthesize_sentence_stream_yields_pcm(self, piper_settings):
+        """Iterator de 3 oraciones → 3 yields de PCM (uno por oración).
+
+        Cada yield contiene el PCM completo de la oración. El consumidor
+        (``play_audio_stream``) los reproduce en tiempo real.
+        """
+        with patch("handlers.piper_tts_client.PiperVoice") as mock_voice_cls, \
+             patch("handlers.piper_tts_client.Path.exists", return_value=True):
+            mock_voice = MagicMock()
+            mock_voice.synthesize_wav.side_effect = _fake_synthesize_wav
+            mock_voice_cls.load.return_value = mock_voice
+
+            client = PiperTTSClient(piper_settings)
+
+            def sentence_iter():
+                yield "Primera oración."
+                yield "Segunda oración."
+                yield "Tercera oración."
+
+            chunks = list(client.synthesize_sentence_stream(sentence_iter()))
+
+            # 3 oraciones → 3 yields de PCM
+            assert len(chunks) == 3
+            for chunk in chunks:
+                # _fake_synthesize_wav escribe 200 bytes PCM (100 samples s16le)
+                assert isinstance(chunk, bytes)
+                assert len(chunk) == 200
+                # No debe empezar con "RIFF" (cabecera WAV)
+                assert not chunk.startswith(b"RIFF")
+
+            # synthesize_wav fue llamada 3 veces (1 por oración)
+            assert mock_voice.synthesize_wav.call_count == 3
+            # Los textos recibidos son las oraciones
+            received = [c.args[0] for c in mock_voice.synthesize_wav.call_args_list]
+            assert received == [
+                "Primera oración.",
+                "Segunda oración.",
+                "Tercera oración.",
+            ]
+
+    def test_synthesize_sentence_stream_skips_empty(self, piper_settings):
+        """Iterator con oraciones VACÍAS o whitespace → se saltean.
+
+        El handler chequea ``sentence.strip()`` antes de invocar
+        ``synthesize()``. ``""`` y ``"   "`` NO deben cargar el modelo
+        NI invocar ``PiperVoice.synthesize_wav``.
+        """
+        with patch("handlers.piper_tts_client.PiperVoice") as mock_voice_cls, \
+             patch("handlers.piper_tts_client.Path.exists", return_value=True):
+            mock_voice = MagicMock()
+            mock_voice.synthesize_wav.side_effect = _fake_synthesize_wav
+            mock_voice_cls.load.return_value = mock_voice
+
+            client = PiperTTSClient(piper_settings)
+
+            def sentence_iter():
+                yield ""        # vacía → skip
+                yield "  "      # whitespace → skip
+                yield "hola"    # real
+                yield ""        # vacía → skip
+                yield "mundo"   # real
+
+            chunks = list(client.synthesize_sentence_stream(sentence_iter()))
+
+            # Solo 2 yields (las 2 oraciones reales)
+            assert len(chunks) == 2
+            assert all(len(c) == 200 for c in chunks)
+
+            # synthesize_wav fue llamada SOLO 2 veces (skip de vacías)
+            assert mock_voice.synthesize_wav.call_count == 2
+            received = [c.args[0] for c in mock_voice.synthesize_wav.call_args_list]
+            assert received == ["hola", "mundo"]
+
+    def test_synthesize_sentence_stream_lazy_load(self, piper_settings):
+        """Iterator VACÍO → NO se carga el modelo Piper (lazy-load).
+
+        El modelo solo debe cargarse cuando hay al menos UNA oración real
+        para sintetizar. Un iter vacío es el caso del caller que no llegó
+        a yield-ear ninguna oración (ej: cancelación durante el streaming).
+        NO debe invocar ``PiperVoice.load`` NI ``PiperVoice.synthesize_wav``.
+        """
+        with patch("handlers.piper_tts_client.PiperVoice") as mock_voice_cls, \
+             patch("handlers.piper_tts_client.Path.exists", return_value=True):
+            mock_voice = MagicMock()
+            mock_voice.synthesize_wav.side_effect = _fake_synthesize_wav
+            mock_voice_cls.load.return_value = mock_voice
+
+            client = PiperTTSClient(piper_settings)
+
+            # Iter vacío
+            def empty_iter():
+                if False:
+                    yield ""  # pragma: no cover
+
+            chunks = list(client.synthesize_sentence_stream(empty_iter()))
+
+            # Sin yields
+            assert chunks == []
+            # PiperVoice.load NO se invocó (modelo no se cargó)
+            mock_voice_cls.load.assert_not_called()
+            # synthesize_wav NO se invocó
+            mock_voice.synthesize_wav.assert_not_called()
+
+    def test_synthesize_sentence_stream_single_sentence(self, piper_settings):
+        """Iterator de UNA oración → un yield de PCM.
+
+        Caso degenerado: solo una oración para sintetizar.
+        """
+        with patch("handlers.piper_tts_client.PiperVoice") as mock_voice_cls, \
+             patch("handlers.piper_tts_client.Path.exists", return_value=True):
+            mock_voice = MagicMock()
+            mock_voice.synthesize_wav.side_effect = _fake_synthesize_wav
+            mock_voice_cls.load.return_value = mock_voice
+
+            client = PiperTTSClient(piper_settings)
+
+            def sentence_iter():
+                yield "Hola mundo"
+
+            chunks = list(client.synthesize_sentence_stream(sentence_iter()))
+
+            # Exactamente 1 yield
+            assert len(chunks) == 1
+            assert len(chunks[0]) == 200
+            assert mock_voice.synthesize_wav.call_count == 1
+
+    def test_synthesize_sentence_stream_propagates_exception(self, piper_settings):
+        """Si ``synthesize`` lanza excepción → el generator PROPAGA la excepción
+        (no la traga). El caller (helper de fallback) depende de esto para
+        detectar la falla y caer al siguiente TTS de la cadena.
+        """
+        with patch("handlers.piper_tts_client.PiperVoice") as mock_voice_cls, \
+             patch("handlers.piper_tts_client.Path.exists", return_value=True):
+            mock_voice = MagicMock()
+            # synthesize_wav lanza RuntimeError → synthesize() la envuelve
+            # en RuntimeError("Piper TTS falló: ...") — el generator debe propagarla.
+            mock_voice.synthesize_wav.side_effect = RuntimeError("modelo roto")
+            mock_voice_cls.load.return_value = mock_voice
+
+            client = PiperTTSClient(piper_settings)
+
+            def sentence_iter():
+                yield "primera"
+
+            with pytest.raises(RuntimeError, match="Piper TTS falló"):
+                list(client.synthesize_sentence_stream(sentence_iter()))

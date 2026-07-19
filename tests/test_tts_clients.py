@@ -331,3 +331,125 @@ def test_no_api_keys_logged(mock_settings, caplog):
     assert secret_azure not in all_logs, (
         f"Azure key filtrada: {[r.getMessage() for r in caplog.records]}"
     )
+
+
+# ──────────────────────────────────────────────────────────────────
+# Azure TTS — synthesize_stream() con style_hint="" (Micro-Spec fallback)
+# ──────────────────────────────────────────────────────────────────
+#
+# Cubre el fix introducido en ``fix/streaming-tts-fallback`` (commit c115c48):
+# cuando ``synthesize_stream`` se invoca con ``style_hint=""`` (caso real desde
+# el helper de fallback de main.py:380 cuando ``parse_response`` no encuentra
+# prefijo [STYLE:]), el SSML generado NO debe incluir ``<mstts:express-as>``
+# (que produciría ``style=""`` inválido).
+
+
+def _make_azure_stream_response(chunks):
+    """Helper: construye un mock del response de ``self._client.stream(...)``.
+
+    ``httpx.Client.stream`` retorna un context manager. ``iter_bytes()`` es
+    el método que el código llama dentro del with para leer chunks PCM.
+    """
+    mock_stream = MagicMock(name="AzureStreamResponse")
+    mock_stream.__enter__.return_value = mock_stream
+    mock_stream.__exit__.return_value = False
+    mock_stream.raise_for_status = MagicMock()
+    mock_stream.iter_bytes.return_value = iter(chunks)
+    return mock_stream
+
+
+@pytest.mark.unit
+class TestAzureSynthesizeStreamStyleHint:
+    """Tests para el fix de ``AzureTTSClient.synthesize_stream()`` con ``style_hint``."""
+
+    @patch("handlers.azure_tts_client.httpx.Client")
+    def test_azure_synthesize_stream_no_style_hint(
+        self, mock_client_cls, mock_settings
+    ):
+        """``synthesize_stream("hola", style_hint="")`` → SSML SIN ``<mstts:express-as>``.
+
+        Verifica el bug del spec §1.3: con ``style_hint=""`` se generaba
+        ``<mstts:express-as style="">`` (SSML inválido). El fix produce un
+        wrapper mínimo, igual que ``synthesize()``.
+        """
+        mock_client = mock_client_cls.return_value
+        fake_pcm_chunks = [b"\x00\x01" * 100, b"\x00\x01" * 100]
+        mock_client.stream.return_value = _make_azure_stream_response(fake_pcm_chunks)
+
+        client = AzureTTSClient(mock_settings, "fake_key", "southamericaeast")
+        list(client.synthesize_stream("hola", style_hint=""))
+
+        # Inspeccionar el body (content kwarg) enviado a httpx.Client.stream
+        assert mock_client.stream.call_count == 1
+        call_kwargs = mock_client.stream.call_args.kwargs
+        ssml_body = call_kwargs["content"]
+        assert isinstance(ssml_body, str)
+
+        # CRÍTICO: no debe haber <mstts:express-as> (ni con style vacío ni válido)
+        assert "<mstts:express-as" not in ssml_body, (
+            f"SSML contiene <mstts:express-as> con style_hint='': {ssml_body!r}"
+        )
+        # Y tampoco el prefijo mstts suelto (xmlns:mstts no debería estar)
+        assert "mstts" not in ssml_body.lower(), (
+            f"SSML contiene 'mstts' con style_hint='': {ssml_body!r}"
+        )
+
+    @patch("handlers.azure_tts_client.httpx.Client")
+    def test_azure_synthesize_stream_with_style_hint(
+        self, mock_client_cls, mock_settings
+    ):
+        """``synthesize_stream("hola", style_hint="cheerful")`` → SSML CON ``<mstts:express-as>``.
+
+        Regresión: no romper el caso con style. La rama ``if style_hint:`` debe
+        seguir generando el wrapper completo con ``xmlns:mstts`` y el tag.
+        """
+        mock_client = mock_client_cls.return_value
+        fake_pcm_chunks = [b"\x00\x01" * 100]
+        mock_client.stream.return_value = _make_azure_stream_response(fake_pcm_chunks)
+
+        client = AzureTTSClient(mock_settings, "fake_key", "southamericaeast")
+        list(client.synthesize_stream("hola", style_hint="cheerful"))
+
+        call_kwargs = mock_client.stream.call_args.kwargs
+        ssml_body = call_kwargs["content"]
+        assert isinstance(ssml_body, str)
+
+        # Debe incluir el wrapper con <mstts:express-as style="cheerful">
+        assert '<mstts:express-as style="cheerful">' in ssml_body
+        # Y el namespace xmlns:mstts
+        assert "xmlns:mstts" in ssml_body
+        assert "mstts:express-as" in ssml_body
+
+    @patch("handlers.azure_tts_client.httpx.Client")
+    def test_azure_synthesize_stream_no_style_hint_has_minimal_wrapper(
+        self, mock_client_cls, mock_settings
+    ):
+        """``synthesize_stream("hola", style_hint="")`` → SSML con ``<speak>`` y ``<voice>`` solamente.
+
+        El wrapper mínimo debe contener la voz configurada y NO debe llevar
+        namespaces innecesarios (``xmlns``, ``xmlns:mstts``).
+        """
+        mock_client = mock_client_cls.return_value
+        fake_pcm_chunks = [b"\x00\x01" * 100]
+        mock_client.stream.return_value = _make_azure_stream_response(fake_pcm_chunks)
+
+        client = AzureTTSClient(mock_settings, "fake_key", "southamericaeast")
+        list(client.synthesize_stream("hola", style_hint=""))
+
+        call_kwargs = mock_client.stream.call_args.kwargs
+        ssml_body = call_kwargs["content"]
+        assert isinstance(ssml_body, str)
+
+        # Wrapper mínimo presente
+        assert "<speak" in ssml_body
+        assert "</speak>" in ssml_body
+        assert "<voice" in ssml_body
+        assert "</voice>" in ssml_body
+        # Voz configurada presente
+        assert "es-AR-TomasNeural" in ssml_body
+        # El texto escapado presente
+        assert "hola" in ssml_body
+        # NO debe llevar xmlns (no se usan namespaces cuando no hay express-as)
+        assert "xmlns=" not in ssml_body, (
+            f"SSML lleva xmlns innecesario con style_hint='': {ssml_body!r}"
+        )

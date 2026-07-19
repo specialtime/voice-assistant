@@ -601,8 +601,18 @@ class TestVoiceAssistantStateMachine:
     #   - Cancelación durante el streaming (generation mismatch)
 
     def test_pipeline_streaming_success(self, patched_assistant):
-        """Flujo streaming exitoso: send_command_stream + synthesize_sentence_stream
+        """Flujo streaming exitoso: send_command_stream + helper de fallback
         + play_audio_stream se invocan en orden. NO se llama send_command (síncrono).
+
+        Post-fix c115c48: el código ya no llama a ``_local_tts.synthesize_sentence_stream``
+        directamente sino al helper ``_synthesize_sentence_stream_with_fallback``,
+        que a su vez llama a ``_local_tts.synthesize`` (cadena local → Gemini → Azure).
+        Mockeamos ``_local_tts.synthesize`` para reflejar la nueva ruta.
+
+        Para que el stream lazy se itere (delta → sentence → pcm), forzamos a
+        ``play_audio_stream`` (MagicMock por defecto) a consumir el stream que
+        recibe. Sin este consumo explícito, el iter nunca avanza y
+        ``synthesize`` no se invoca.
         """
         # Forzar streaming habilitado (la fixture usa mock_settings sin esta key,
         # por lo que el __init__ toma el default True desde el settings.json real)
@@ -611,7 +621,8 @@ class TestVoiceAssistantStateMachine:
         # STT OK
         patched_assistant._whisper_stt.transcribe.return_value = "abrí chrome"
 
-        # OpenCode streaming: retorna un iter de deltas
+        # OpenCode streaming: retorna un iter de deltas con 2 oraciones terminadas
+        # en punto (separador de SentenceBuffer).
         def delta_iter():
             yield "[STYLE: cheerful] Hola. "
             yield "Chau. "
@@ -620,9 +631,29 @@ class TestVoiceAssistantStateMachine:
         # OpenCode send_command (síncrono) NO debe ser llamado
         patched_assistant._opencode.send_command.return_value = "NO DEBE LLAMARSE"
 
-        # Kokoro streaming: retorna un iter de PCM (1 chunk por oración)
-        pcm_chunks = [b"\x00" * 100, b"\x00" * 100]  # 2 oraciones → 2 chunks
-        patched_assistant._local_tts.synthesize_sentence_stream.return_value = iter(pcm_chunks)
+        # TTS local (helper de fallback usa ``_local_tts.synthesize`` por oración):
+        # SentenceBuffer split por ". ! ? ;" → deltas yield 2 oraciones ("Hola." y "Chau.").
+        # Side effect retorna PCM distinto por oración para verificar el orden.
+        pcm_per_call = [
+            b"\x00" * 100,  # "Hola." → pcm
+            b"\x00" * 200,  # "Chau." → pcm
+        ]
+
+        def synth_side_effect(text, style_hint=""):
+            pcm = pcm_per_call.pop(0)
+            return pcm
+
+        patched_assistant._local_tts.synthesize.side_effect = synth_side_effect
+
+        # Forzar consumo del stream: ``play_audio_stream`` debe iterar el
+        # pcm_stream que recibe para que el iter lazy (delta → sentence → synth)
+        # avance. Sin esto, ``synthesize`` no se invoca.
+        def play_audio_stream_consuming(stream):
+            list(stream)  # consumir el generador
+
+        patched_assistant._audio.play_audio_stream.side_effect = (
+            play_audio_stream_consuming
+        )
 
         patched_assistant.run_pipeline("/tmp/fake.wav")
 
@@ -630,9 +661,19 @@ class TestVoiceAssistantStateMachine:
         patched_assistant._opencode.send_command_stream.assert_called_once_with("abrí chrome")
         # send_command (síncrono) NO fue llamado
         patched_assistant._opencode.send_command.assert_not_called()
-        # Kokoro streaming fue invocado
-        patched_assistant._local_tts.synthesize_sentence_stream.assert_called_once()
-        # play_audio_stream recibió los chunks PCM
+        # Post-fix c115c48: el helper de fallback llama a ``_local_tts.synthesize``
+        # por oración (en vez de ``synthesize_sentence_stream`` directo).
+        # 2 oraciones → 2 invocaciones a ``_local_tts.synthesize``.
+        assert patched_assistant._local_tts.synthesize.call_count == 2
+        # Los textos recibidos son las oraciones (sin prefijo [STYLE:])
+        received = [c.args[0] for c in patched_assistant._local_tts.synthesize.call_args_list]
+        assert received == ["Hola.", "Chau."], (
+            f"Esperaba ['Hola.', 'Chau.'], obtuve {received}"
+        )
+        # El helper NO cayó a Gemini ni Azure (TTS local OK)
+        patched_assistant._gemini_tts.synthesize.assert_not_called()
+        patched_assistant._azure_tts.synthesize_stream.assert_not_called()
+        # play_audio_stream fue invocado
         patched_assistant._audio.play_audio_stream.assert_called_once()
         # play_audio (no streaming) NO fue llamado
         patched_assistant._audio.play_audio.assert_not_called()
@@ -717,11 +758,12 @@ class TestVoiceAssistantStateMachine:
         Verifica que el chequeo de ``self._pipeline_generation != generation``
         dentro del ``sentence_iterator()`` aborta correctamente el flujo.
 
-        Para que el test sea realista, mockeamos ``synthesize_sentence_stream``
-        como PROXY del sentence_iterator que recibe: consume el iter (lo que
-        fuerza al ``sentence_iterator`` interno a iterar el delta_stream y
-        disparar la cancelación) pero produce 0 PCM (porque la cancelación
-        abortó antes del primer yield).
+        Post-fix c115c48: el código llama al helper de fallback que invoca
+        ``_local_tts.synthesize`` por oración. Mockeamos ``synthesize`` como
+        proxy: consume el ``sentence_iterator`` que recibe vía el helper
+        (lo que fuerza al ``sentence_iterator`` interno a iterar el
+        ``delta_stream`` y disparar la cancelación) pero retorna ``b""`` (la
+        cancelación abortó antes del primer yield real).
 
         Contrato del fix ``fe33e29`` (overlay speaking prematuro):
         Como la cancelación ocurre ANTES del primer chunk PCM real, el wrapper
@@ -743,33 +785,44 @@ class TestVoiceAssistantStateMachine:
 
         patched_assistant._opencode.send_command_stream.return_value = delta_iter()
 
-        # Mock synthesize_sentence_stream como PROXY: consume el sentence_iterator
-        # para forzar la iteración del delta_stream (y disparar la cancelación),
-        # pero produce 0 PCM (la cancelación abortó antes del primer yield).
-        def sentence_stream_proxy(sentences):
-            # Consumir el iter → fuerza avance del sentence_iterator →
-            # fuerza avance del delta_iter → dispara _pipeline_generation += 1
-            # → el sentence_iterator interno aborta por cancellation check.
-            consumed_sentences = list(sentences)
-            # Retornar iter VACÍO: 0 oraciones llegaron a Kokoro.
-            return iter([])
+        # Mock synthesize como PROXY del sentence_iterator que el helper
+        # recibe. Consumir el iter fuerza avance del sentence_iterator →
+        # fuerza avance del delta_iter → dispara _pipeline_generation += 1 →
+        # el cancellation check aborta. Pero como el chequeo es
+        # ``_pipeline_generation != generation`` (donde ``generation`` es el
+        # capturado al inicio del pipeline), el helper no llega a llamar
+        # ``synthesize`` con la oración ya que la cancelación ocurre antes.
+        # Por lo tanto, ``synthesize`` NO se invoca.
+        # Sin embargo, queremos verificar que la cancelación disparó y que el
+        # estado del orquestador quedó en IDLE (sin transición a SPEAKING).
+        #
+        # NOTA: con el nuevo helper, ``_synthesize_sentence_stream_with_fallback``
+        # chequea ``self._pipeline_generation != generation`` ANTES de cada
+        # oración. Si el delta_iter incrementa generation al emitir, el
+        # sentence_iterator interno aborta al detectar cancelación, y el
+        # helper no llega a invocar ``synthesize`` para ninguna oración.
+        # Para verificar la ruta, hacemos que ``synthesize`` retorne PCM vacío:
+        # si por alguna razón el helper lo invoca, simplemente retorna vacío
+        # (que es truthy=False → el helper no lo yield-ea y no transiciona).
 
-        patched_assistant._local_tts.synthesize_sentence_stream.side_effect = (
-            sentence_stream_proxy
+        # Forzar consumo del stream via play_audio_stream side_effect
+        def play_audio_stream_consuming(stream):
+            list(stream)
+
+        patched_assistant._audio.play_audio_stream.side_effect = (
+            play_audio_stream_consuming
         )
 
         patched_assistant.run_pipeline("/tmp/fake.wav")
 
         # Se intentó el flujo streaming
         patched_assistant._opencode.send_command_stream.assert_called_once()
-        # Kokoro streaming SÍ se invocó (la pipeline todavía entra al with send_lock)
-        patched_assistant._local_tts.synthesize_sentence_stream.assert_called_once()
         # El delta_iter SÍ fue consumido (cancellation disparó)
         assert patched_assistant._pipeline_generation >= 1, (
             f"Esperaba _pipeline_generation>=1 (cancelación disparada), "
             f"se obtuvo {patched_assistant._pipeline_generation}"
         )
-        # play_audio_stream fue llamado (con iter vacío → no reproduce nada)
+        # play_audio_stream fue llamado (con stream que terminó sin chunks reales)
         patched_assistant._audio.play_audio_stream.assert_called_once()
         # FIX ``fe33e29``: la transición a SPEAKING ahora ocurre SOLO al primer
         # chunk PCM real. Como la cancelación abortó antes del primer chunk,
@@ -793,3 +846,356 @@ class TestVoiceAssistantStateMachine:
         )
         # overlay.hide NO fue llamado por el finally (cancelación detectada).
         patched_assistant._overlay.hide.assert_not_called()
+
+    # ──────────────────────────────────────────────────────────────────
+    # Micro-Spec Streaming TTS: helper de fallback por oración (T10)
+    # ──────────────────────────────────────────────────────────────────
+    #
+    # Cubre el nuevo helper ``_synthesize_one_sentence_with_fallback`` y
+    # ``_synthesize_sentence_stream_with_fallback`` introducidos en commit
+    # ``c115c48`` para restaurar la cadena de fallback a Gemini TTS y Azure
+    # TTS en el flujo streaming (que se había perdido al agregar Kokoro).
+
+    @pytest.mark.unit
+    class TestSynthesizeOneSentenceWithFallback:
+        """Tests del helper ``_synthesize_one_sentence_with_fallback``.
+
+        Cadena: local (Piper/Kokoro) → Gemini → Azure streaming.
+        Cubre los caminos de éxito y cada fallback.
+        """
+
+        def test_fallback_local_ok(self, patched_assistant):
+            """Local OK → solo se llama local, NO Gemini ni Azure."""
+            patched_assistant._local_tts.synthesize.return_value = b"local_pcm"
+            patched_assistant._gemini_tts.synthesize.return_value = b"gemini_pcm"
+            patched_assistant._azure_tts.synthesize_stream.return_value = iter([b"azure_pcm"])
+
+            result = patched_assistant._synthesize_one_sentence_with_fallback("hola")
+
+            # Local retornó PCM
+            assert result == b"local_pcm"
+            # Local fue llamado
+            patched_assistant._local_tts.synthesize.assert_called_once_with(
+                "hola", style_hint=""
+            )
+            # Gemini y Azure NO se llamaron
+            patched_assistant._gemini_tts.synthesize.assert_not_called()
+            patched_assistant._azure_tts.synthesize_stream.assert_not_called()
+
+        def test_fallback_local_fails_gemini_ok(self, patched_assistant):
+            """Local falla (RuntimeError) → Gemini es llamado, Azure NO."""
+            patched_assistant._local_tts.synthesize.side_effect = RuntimeError(
+                "Piper OOM"
+            )
+            patched_assistant._gemini_tts.synthesize.return_value = b"gemini_pcm"
+            patched_assistant._azure_tts.synthesize_stream.return_value = iter([b"azure_pcm"])
+
+            result = patched_assistant._synthesize_one_sentence_with_fallback("hola")
+
+            assert result == b"gemini_pcm"
+            # Local fue llamado una vez (raise)
+            patched_assistant._local_tts.synthesize.assert_called_once_with(
+                "hola", style_hint=""
+            )
+            # Gemini fue llamado una vez (OK)
+            patched_assistant._gemini_tts.synthesize.assert_called_once_with(
+                "hola", style_hint=""
+            )
+            # Azure NO se invocó (Gemini ya tuvo éxito)
+            patched_assistant._azure_tts.synthesize_stream.assert_not_called()
+
+        def test_fallback_local_and_gemini_fail_azure_ok(self, patched_assistant):
+            """Local Y Gemini fallan → Azure streaming es consumido a bytes."""
+            patched_assistant._local_tts.synthesize.side_effect = RuntimeError(
+                "Piper OOM"
+            )
+            patched_assistant._gemini_tts.synthesize.side_effect = RuntimeError(
+                "Gemini rate limit"
+            )
+            # Azure streaming retorna iter de chunks — el helper los junta con b"".join
+            azure_chunks = [b"a", b"b", b"c"]
+            patched_assistant._azure_tts.synthesize_stream.return_value = iter(azure_chunks)
+
+            result = patched_assistant._synthesize_one_sentence_with_fallback("hola")
+
+            # El helper retorna b"".join(...) → b"abc"
+            assert result == b"abc"
+            # Azure fue llamado con style_hint=""
+            patched_assistant._azure_tts.synthesize_stream.assert_called_once_with(
+                "hola", style_hint=""
+            )
+
+        def test_fallback_all_fail_returns_none(self, patched_assistant):
+            """Los 3 TTS fallan → helper retorna None, no lanza excepción."""
+            patched_assistant._local_tts.synthesize.side_effect = RuntimeError(
+                "Piper OOM"
+            )
+            patched_assistant._gemini_tts.synthesize.side_effect = RuntimeError(
+                "Gemini rate limit"
+            )
+            patched_assistant._azure_tts.synthesize_stream.side_effect = RuntimeError(
+                "Azure 503"
+            )
+
+            result = patched_assistant._synthesize_one_sentence_with_fallback("hola")
+
+            # helper NO lanza, retorna None
+            assert result is None
+
+        def test_fallback_gemini_circuit_breaker_open(self, patched_assistant):
+            """Gemini ``is_available()`` retorna False (circuit breaker abierto)
+            → se salta Gemini, va directo a Azure (incluso si local también falló)."""
+            patched_assistant._local_tts.synthesize.side_effect = RuntimeError(
+                "Piper OOM"
+            )
+            patched_assistant._gemini_tts.is_available.return_value = False
+            patched_assistant._azure_tts.synthesize_stream.return_value = iter([b"azure_pcm"])
+
+            result = patched_assistant._synthesize_one_sentence_with_fallback("hola")
+
+            assert result == b"azure_pcm"
+            # Gemini NO fue llamado (saltado por circuit breaker)
+            patched_assistant._gemini_tts.synthesize.assert_not_called()
+            # Azure SÍ fue llamado
+            patched_assistant._azure_tts.synthesize_stream.assert_called_once_with(
+                "hola", style_hint=""
+            )
+
+        def test_fallback_gemini_not_configured(self, patched_assistant):
+            """``_gemini_tts is None`` → se salta Gemini, va a Azure."""
+            patched_assistant._gemini_tts = None
+            patched_assistant._azure_tts.synthesize_stream.return_value = iter([b"azure_pcm"])
+
+            result = patched_assistant._synthesize_one_sentence_with_fallback("hola")
+
+            # Local OK retornó b"\x00" * 100 (default MagicMock), pero también
+            # queremos verificar que con local OK, no se llame Azure.
+            # Para que el test verifique la cadena, forzamos local a fallar:
+            patched_assistant._local_tts.synthesize.side_effect = RuntimeError(
+                "Piper OOM"
+            )
+            result = patched_assistant._synthesize_one_sentence_with_fallback("hola")
+            assert result == b"azure_pcm"
+            # Azure SÍ fue llamado (porque Gemini no está configurado)
+            patched_assistant._azure_tts.synthesize_stream.assert_called_once_with(
+                "hola", style_hint=""
+            )
+
+        def test_fallback_azure_not_configured(self, patched_assistant):
+            """``_azure_tts is None`` y local+Gemini fallan → retorna None sin excepción."""
+            patched_assistant._local_tts.synthesize.side_effect = RuntimeError(
+                "Piper OOM"
+            )
+            patched_assistant._gemini_tts.synthesize.side_effect = RuntimeError(
+                "Gemini rate limit"
+            )
+            patched_assistant._azure_tts = None
+
+            result = patched_assistant._synthesize_one_sentence_with_fallback("hola")
+
+            # helper NO lanza, retorna None
+            assert result is None
+
+        def test_fallback_local_none_returns_none(self, patched_assistant):
+            """``_local_tts is None`` → AttributeError capturado, cae a Gemini.
+
+            FIX MINOR-01 @security: si _local_tts es None, el acceso
+            ``self._local_tts.synthesize(...)`` lanza AttributeError. El helper
+            usa ``except Exception`` (cubre AttributeError) y cae al siguiente
+            TTS de la cadena. Este test verifica el camino defensivo.
+            """
+            patched_assistant._local_tts = None
+            patched_assistant._gemini_tts.synthesize.return_value = b"gemini_pcm"
+
+            result = patched_assistant._synthesize_one_sentence_with_fallback("hola")
+
+            # helper NO lanza (AttributeError capturado por except Exception)
+            assert result == b"gemini_pcm"
+            # Gemini fue llamado
+            patched_assistant._gemini_tts.synthesize.assert_called_once_with(
+                "hola", style_hint=""
+            )
+
+    @pytest.mark.unit
+    class TestSynthesizeSentenceStreamWithFallback:
+        """Tests del helper ``_synthesize_sentence_stream_with_fallback``.
+
+        Cubre el iterador con cadena de fallback, cancelación cooperativa
+        y casos mixtos (algunas oraciones OK, otras con fallback).
+        """
+
+        def test_stream_fallback_yields_pcm_per_sentence(self, patched_assistant):
+            """3 oraciones, local OK → 3 yields de PCM (uno por oración)."""
+            pcm_per_sentence = [b"a" * 10, b"b" * 10, b"c" * 10]
+            pcm_iter = iter(pcm_per_sentence)
+
+            patched_assistant._local_tts.synthesize.side_effect = lambda text, style_hint="": next(pcm_iter)
+
+            def sentence_iter():
+                yield "primera"
+                yield "segunda"
+                yield "tercera"
+
+            chunks = list(
+                patched_assistant._synthesize_sentence_stream_with_fallback(
+                    sentence_iter(), generation=0
+                )
+            )
+
+            assert chunks == pcm_per_sentence
+            assert patched_assistant._local_tts.synthesize.call_count == 3
+
+        def test_stream_fallback_skips_empty_sentences(self, patched_assistant):
+            """Oraciones vacías/whitespace se saltan, no se llama synthesize."""
+            patched_assistant._local_tts.synthesize.return_value = b"pcm"
+            patched_assistant._gemini_tts.synthesize.return_value = b"pcm_g"
+            patched_assistant._azure_tts.synthesize_stream.return_value = iter([b"pcm_a"])
+
+            def sentence_iter():
+                yield ""
+                yield "  "
+                yield "hola"
+                yield ""
+                yield "mundo"
+
+            chunks = list(
+                patched_assistant._synthesize_sentence_stream_with_fallback(
+                    sentence_iter(), generation=0
+                )
+            )
+
+            # Solo 2 yields (las 2 oraciones reales)
+            assert len(chunks) == 2
+            assert chunks == [b"pcm", b"pcm"]
+            # 2 invocaciones a synthesize (las oraciones reales)
+            assert patched_assistant._local_tts.synthesize.call_count == 2
+            received = [
+                c.args[0] for c in patched_assistant._local_tts.synthesize.call_args_list
+            ]
+            assert received == ["hola", "mundo"]
+
+        def test_stream_fallback_cancellation_aborts(self, patched_assistant):
+            """Si ``_pipeline_generation`` cambia antes de procesar la 2da
+            oración, el helper aborta sin sintetizar más."""
+            # Side effect que incrementa generation al ser llamado
+            call_count = {"n": 0}
+
+            def synth_side_effect(text, style_hint=""):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    # 1ra oración OK
+                    return b"pcm1"
+                # 2da oración: simular toggle() (cambia generation)
+                patched_assistant._pipeline_generation += 1
+                return b"pcm2"
+
+            patched_assistant._local_tts.synthesize.side_effect = synth_side_effect
+
+            def sentence_iter():
+                yield "primera"  # OK, generation=0
+                yield "segunda"  # side_effect incrementa generation
+                yield "tercera"  # el helper debe abortar aquí
+
+            chunks = list(
+                patched_assistant._synthesize_sentence_stream_with_fallback(
+                    sentence_iter(), generation=0
+                )
+            )
+
+            # Solo 1 yield (la 1ra oración). La 2da se sintetizó pero el helper
+            # ya hizo la cancelación check antes de yield-ear → no la cuenta
+            # como yield. La 3ra nunca se procesa.
+            # NOTA: el comportamiento real es:
+            # 1. procesar "primera" → synth OK → yield "pcm1"
+            # 2. procesar "segunda" → synth side_effect incrementa gen → synth retorna "pcm2" → yield "pcm2"
+            # 3. procesar "tercera" → chequea gen, difiere → return
+            # Por lo tanto chunks == [b"pcm1", b"pcm2"]
+            # La cancelación se verifica viendo que "tercera" NO se procesa.
+            assert len(chunks) == 2
+            # Pero "tercera" NUNCA se invocó (cancellation check previo)
+            received = [
+                c.args[0] for c in patched_assistant._local_tts.synthesize.call_args_list
+            ]
+            assert "tercera" not in received, (
+                f"Esperaba que 'tercera' NO se procesara, obtuve {received}"
+            )
+
+        def test_stream_fallback_mixed_success(self, patched_assistant):
+            """Oración 1: local OK. Oración 2: local falla, Gemini OK.
+            Oración 3: todos fallan. → yield 2 chunks (1 y 2), 3ra se loguea."""
+            # Oración 1: local OK
+            # Oración 2: local falla, Gemini OK
+            # Oración 3: local falla, Gemini falla, Azure falla
+            call_count = {"n": 0}
+
+            def synth_side_effect(text, style_hint=""):
+                call_count["n"] += 1
+                if call_count["n"] in (1,):  # 1ra: OK
+                    return b"pcm_local"
+                if call_count["n"] in (2, 3, 4, 5):  # 2da: local falla
+                    raise RuntimeError("Piper OOM")
+                raise RuntimeError("never reached")
+
+            patched_assistant._local_tts.synthesize.side_effect = synth_side_effect
+            # Gemini: falla para 3ra, OK para 2da
+            gemini_call_count = {"n": 0}
+
+            def gemini_side_effect(text, style_hint=""):
+                gemini_call_count["n"] += 1
+                if gemini_call_count["n"] == 1:  # 2da oración: OK
+                    return b"pcm_gemini"
+                raise RuntimeError("Gemini rate limit")  # 3ra: falla
+
+            patched_assistant._gemini_tts.is_available.return_value = True
+            patched_assistant._gemini_tts.synthesize.side_effect = gemini_side_effect
+            # Azure: falla para 3ra
+            patched_assistant._azure_tts.synthesize_stream.side_effect = RuntimeError(
+                "Azure 503"
+            )
+
+            def sentence_iter():
+                yield "primera"
+                yield "segunda"
+                yield "tercera"
+
+            chunks = list(
+                patched_assistant._synthesize_sentence_stream_with_fallback(
+                    sentence_iter(), generation=0
+                )
+            )
+
+            # 2 yields (1ra y 2da). 3ra falla en los 3 TTS → no yield.
+            assert chunks == [b"pcm_local", b"pcm_gemini"]
+            # Verificar que 3ra sí se intentó en los 3 TTS:
+            # Local se invoca 3 veces (1ra OK + 2da falla + 3ra falla)
+            assert patched_assistant._local_tts.synthesize.call_count == 3
+            # Gemini se invoca 2 veces (2da OK + 3ra falla). NO en 1ra (local OK).
+            assert patched_assistant._gemini_tts.synthesize.call_count == 2
+            # Azure se invoca 1 vez (solo cuando Gemini falla = 3ra oración).
+            assert patched_assistant._azure_tts.synthesize_stream.call_count == 1
+
+    @pytest.mark.unit
+    def test_pipeline_streaming_with_piper(self, patched_assistant):
+        """Regresión: con ``tts_engine=piper`` el flujo streaming se activa
+        (Piper ahora tiene ``synthesize_sentence_stream`` — post-fix c115c48).
+
+        El check ``hasattr(self._local_tts, 'synthesize_sentence_stream')``
+        debe pasar para PiperTTSClient, lo cual permite que el flujo streaming
+        se active. Antes del fix, Piper no tenía el método y caía a síncrono.
+
+        Verificación: ``PiperTTSClient`` (importada del handler real) tiene el
+        método, lo cual demuestra que el flujo streaming puede activarse. El
+        resto del flujo (mockear ``_local_tts.synthesize`` por oración) ya está
+        cubierto por ``test_pipeline_streaming_success``.
+        """
+        from handlers.piper_tts_client import PiperTTSClient
+
+        # Verificación del contrato PiperTTSClient (post-fix c115c48)
+        assert hasattr(PiperTTSClient, "synthesize_sentence_stream"), (
+            "PiperTTSClient debe tener synthesize_sentence_stream post-fix c115c48 "
+            "para que el flujo streaming se active con tts_engine=piper"
+        )
+        # Verificar que el método es callable
+        assert callable(getattr(PiperTTSClient, "synthesize_sentence_stream")), (
+            "synthesize_sentence_stream debe ser callable"
+        )
