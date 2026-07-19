@@ -20,6 +20,9 @@
     "locale": "es-MX",
     "output_format": "raw-24khz-16bit-mono-pcm"
   },
+  "tts": {
+    "primary_engine": "local"
+  },
   "local": {
     "tts_engine": "kokoro",
     "whisper": {

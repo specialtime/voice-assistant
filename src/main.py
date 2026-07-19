@@ -80,18 +80,29 @@ class VoiceAssistant:
         self._whisper_stt = WhisperSTTClient(self._settings)
         self._stt = GeminiSTTClient(self._settings, gemini_key) if gemini_key else None
 
-        # TTS local: selector de motor (piper | kokoro)
-        tts_engine = self._settings.get("local", {}).get("tts_engine", "piper")
-        if tts_engine not in ("piper", "kokoro"):
-            logger.warning("tts_engine='%s' inválido, usando 'piper' por defecto", tts_engine)
-            tts_engine = "piper"
+        # TTS primario: ¿usar local o saltar directo a cloud?
+        primary_engine = self._settings.get("tts", {}).get("primary_engine", "local")
+        if primary_engine not in ("local", "gemini", "azure"):
+            logger.warning("tts.primary_engine='%s' inválido, usando 'local' por defecto", primary_engine)
+            primary_engine = "local"
 
-        if tts_engine == "kokoro":
-            self._local_tts = KokoroTTSClient(self._settings)
-            logger.info("TTS local: Kokoro (selector)")
+        self._tts_primary_engine = primary_engine
+
+        # TTS local: solo instanciar si primary_engine == "local"
+        if primary_engine == "local":
+            tts_engine = self._settings.get("local", {}).get("tts_engine", "piper")
+            if tts_engine not in ("piper", "kokoro"):
+                logger.warning("tts_engine='%s' inválido, usando 'piper' por defecto", tts_engine)
+                tts_engine = "piper"
+            if tts_engine == "kokoro":
+                self._local_tts = KokoroTTSClient(self._settings)
+                logger.info("TTS local: Kokoro (selector)")
+            else:
+                self._local_tts = PiperTTSClient(self._settings)
+                logger.info("TTS local: Piper (selector)")
         else:
-            self._local_tts = PiperTTSClient(self._settings)
-            logger.info("TTS local: Piper (selector)")
+            self._local_tts = None
+            logger.info("TTS local deshabilitado — primary_engine=%s", primary_engine)
 
         # TTS cloud fallback (sin cambios)
         self._gemini_tts = GeminiTTSClient(self._settings, gemini_key) if gemini_key else None
@@ -357,29 +368,45 @@ class VoiceAssistant:
             self._overlay.set_state("speaking")
             logger.info("→ SPEAKING (gen=%d)", generation)
 
-        # 5 + 6. TTS — local (primario) → Gemini (fallback 1) → Azure streaming (fallback 2)
+        # 5 + 6. TTS — cadena según _tts_primary_engine
+        #   'local':  local → Gemini → Azure
+        #   'gemini': Gemini → Azure
+        #   'azure':  Azure streaming directo
         pcm_bytes = None
-        try:
-            pcm_bytes = self._local_tts.synthesize(clean_text, style_hint)
-            logger.debug("TTS local OK — %d bytes", len(pcm_bytes))
-        except Exception as e:
-            logger.warning("TTS local falló (%s), intentando Gemini fallback", e)
+        tts_done = False
+
+        # 1. TTS local (solo si primary_engine == "local")
+        if self._tts_primary_engine == "local" and self._local_tts is not None:
             try:
-                if self._gemini_tts is None:
-                    raise RuntimeError("Gemini TTS no configurado")
-                if not self._gemini_tts.is_available():
-                    raise RuntimeError("Gemini TTS circuit breaker abierto")
-                pcm_bytes = self._gemini_tts.synthesize(clean_text, style_hint)
-                logger.debug("TTS Gemini fallback OK — %d bytes", len(pcm_bytes))
-            except Exception as e2:
-                logger.warning("Gemini TTS falló (%s), intentando Azure streaming fallback", e2)
-                if self._azure_tts is None:
-                    logger.error("Azure TTS no configurado (AZURE_SPEECH_KEY faltante)")
-                    return
-                # Streaming Azure: reproducir en tiempo real (latencia baja al primer sample)
-                self._audio.play_audio_stream(self._azure_tts.synthesize_stream(clean_text, style_hint))
-                logger.debug("TTS Azure streaming OK")
-                # pcm_bytes se queda en None → paso 7 se salta (ya reproducido)
+                pcm_bytes = self._local_tts.synthesize(clean_text, style_hint)
+                logger.debug("TTS local OK — %d bytes", len(pcm_bytes))
+                tts_done = True
+            except Exception as e:
+                logger.warning("TTS local falló (%s), intentando Gemini fallback", e)
+
+        # 2. Gemini TTS (fallback para 'local' y 'gemini'; primario para 'gemini')
+        if not tts_done and self._tts_primary_engine in ("local", "gemini") and self._gemini_tts is not None:
+            if self._gemini_tts.is_available():
+                try:
+                    pcm_bytes = self._gemini_tts.synthesize(clean_text, style_hint)
+                    logger.debug("TTS Gemini OK — %d bytes", len(pcm_bytes))
+                    tts_done = True
+                except Exception as e2:
+                    logger.warning("Gemini TTS falló (%s), intentando Azure streaming fallback", e2)
+            else:
+                logger.warning("Gemini TTS circuit breaker abierto — saltando a Azure")
+
+        # 3. Azure TTS streaming (fallback para 'local' y 'gemini'; primario para 'azure')
+        if not tts_done and self._tts_primary_engine in ("local", "gemini", "azure") and self._azure_tts is not None:
+            # Streaming Azure: reproducir en tiempo real (latencia baja al primer sample)
+            self._audio.play_audio_stream(self._azure_tts.synthesize_stream(clean_text, style_hint))
+            logger.debug("TTS Azure streaming OK")
+            # pcm_bytes se queda en None → paso 7 se salta (ya reproducido)
+            tts_done = True
+
+        if not tts_done:
+            logger.error("Todos los TTS fallaron para texto: '%s'", clean_text[:80])
+            return
 
         # 7. Playback (local o Gemini — no streaming)
         if pcm_bytes:
@@ -423,34 +450,40 @@ class VoiceAssistant:
                 yield pcm
 
     def _synthesize_one_sentence_with_fallback(self, sentence: str) -> Optional[bytes]:
-        """Sintetiza una oración con cadena local → Gemini → Azure.
+        """Sintetiza una oración con cadena según _tts_primary_engine.
+
+        - 'local':  local → Gemini → Azure
+        - 'gemini': Gemini → Azure
+        - 'azure':  Azure solo
 
         Retorna PCM bytes si algún TTS funciona, None si todos fallan.
         No lanza excepciones — el caller decide qué hacer con None.
         """
-        # 1. TTS local (Piper o Kokoro)
-        try:
-            return self._local_tts.synthesize(sentence, style_hint="")
-        except Exception as e:
-            logger.warning(
-                "TTS local falló para oración (%s: %s), intentando Gemini",
-                type(e).__name__, e,
-            )
-
-        # 2. Gemini TTS (fallback 1)
-        if self._gemini_tts is not None and self._gemini_tts.is_available():
+        # 1. TTS local (solo si primary_engine == "local")
+        if self._tts_primary_engine == "local" and self._local_tts is not None:
             try:
-                return self._gemini_tts.synthesize(sentence, style_hint="")
+                return self._local_tts.synthesize(sentence, style_hint="")
             except Exception as e:
                 logger.warning(
-                    "Gemini TTS falló (%s: %s), intentando Azure",
+                    "TTS local falló para oración (%s: %s), intentando Gemini",
                     type(e).__name__, e,
                 )
-        elif self._gemini_tts is not None and not self._gemini_tts.is_available():
-            logger.warning("Gemini TTS circuit breaker abierto — saltando a Azure")
 
-        # 3. Azure TTS streaming (fallback 2) — consumir a bytes
-        if self._azure_tts is not None:
+        # 2. Gemini TTS (fallback para 'local' y 'gemini'; primario para 'gemini')
+        if self._tts_primary_engine in ("local", "gemini") and self._gemini_tts is not None:
+            if self._gemini_tts.is_available():
+                try:
+                    return self._gemini_tts.synthesize(sentence, style_hint="")
+                except Exception as e:
+                    logger.warning(
+                        "Gemini TTS falló (%s: %s), intentando Azure",
+                        type(e).__name__, e,
+                    )
+            else:
+                logger.warning("Gemini TTS circuit breaker abierto — saltando a Azure")
+
+        # 3. Azure TTS (fallback para 'local' y 'gemini'; primario para 'azure')
+        if self._tts_primary_engine in ("local", "gemini", "azure") and self._azure_tts is not None:
             try:
                 return b"".join(self._azure_tts.synthesize_stream(sentence, style_hint=""))
             except Exception as e:
