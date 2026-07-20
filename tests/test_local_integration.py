@@ -620,16 +620,59 @@ class TestTTSEngineSelector:
     inválido cae con warning al default (piper).
     """
 
-    def test_selector_piper_default(self, patched_assistant):
+    def test_selector_piper_default(self, env_keys, mock_overlay, monkeypatch):
         """``tts_engine='piper'`` (default) → ``_local_tts`` se construye
-        vía ``PiperTTSClient`` y ``KokoroTTSClient`` NUNCA se instancia."""
-        # Assert: el selector eligió Piper, no Kokoro
-        from main import PiperTTSClient, KokoroTTSClient
+        vía ``PiperTTSClient`` y ``KokoroTTSClient`` NUNCA se instancia.
 
-        PiperTTSClient.assert_called_once()
-        KokoroTTSClient.assert_not_called()
-        # El atributo ``_local_tts`` debe ser la instancia mock de Piper
-        assert patched_assistant._local_tts is PiperTTSClient.return_value
+        Replica el patrón de ``test_selector_kokoro``: mockea ``open()``
+        con ``mock_open`` para forzar el settings sintético (con
+        ``tts_engine='piper'``) ANTES de instanciar ``VoiceAssistant``,
+        ya que el ``config/settings.json`` real tiene ``tts_engine='kokoro'``
+        por defecto y el ``__init__`` del orquestador lee ese JSON real.
+        La fixture ``patched_assistant`` solo sobreescribe
+        ``assistant._settings`` DESPUÉS de la instanciación, lo cual no
+        afecta qué cliente se construye en el ``__init__``.
+        """
+        import json
+        from unittest.mock import mock_open
+
+        monkeypatch.chdir(_PROJECT_ROOT)
+
+        piper_settings = _build_piper_settings_dict()
+        m = mock_open(read_data=json.dumps(piper_settings))
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("main.AzureTTSClient", MagicMock(name="AzureTTSClient"))
+            mp.setattr("main.GeminiTTSClient", MagicMock(name="GeminiTTSClient"))
+            mp.setattr("main.OpenCodeClient", MagicMock(name="OpenCodeClient"))
+            mp.setattr("main.GeminiSTTClient", MagicMock(name="GeminiSTTClient"))
+            mp.setattr("main.WhisperSTTClient", MagicMock(name="WhisperSTTClient"))
+            mp.setattr("main.PiperTTSClient", MagicMock(name="PiperTTSClient"))
+            mp.setattr("main.KokoroTTSClient", MagicMock(name="KokoroTTSClient"))
+            mp.setattr("main.AudioManager", MagicMock(name="AudioManager"))
+            mp.setattr("main.load_dotenv", lambda: None)
+            # Forzar el settings sintético con tts_engine='piper' en
+            # lugar del config/settings.json real (que viene con
+            # tts_engine='kokoro').
+            mp.setattr("builtins.open", m)
+
+            from main import (
+                VoiceAssistant,
+                PiperTTSClient,
+                KokoroTTSClient,
+                AudioManager,
+            )
+
+            AudioManager.return_value = MagicMock(name="AudioManagerInstance")
+            PiperTTSClient.return_value = MagicMock(name="PiperTTSClientInstance")
+            KokoroTTSClient.return_value = MagicMock(name="KokoroTTSClientInstance")
+
+            assistant = VoiceAssistant()
+
+            # Assert: el selector eligió Piper, no Kokoro
+            PiperTTSClient.assert_called_once()
+            KokoroTTSClient.assert_not_called()
+            assert assistant._local_tts is PiperTTSClient.return_value
 
     def test_selector_kokoro(self, env_keys, mock_overlay, monkeypatch):
         """``tts_engine='kokoro'`` → ``_local_tts`` se construye vía
