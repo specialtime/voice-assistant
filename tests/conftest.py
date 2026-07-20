@@ -40,8 +40,13 @@ for _p in (str(_SRC), str(_PROJECT_ROOT)):
 # heredó sus variables. pytest importa `conftest.py` antes de
 # recolectar/evaluar cualquier fixture, por lo que cualquier
 # `os.getenv()` posterior ya tendrá las variables disponibles.
+#
+# Se carga explícitamente desde `_PROJECT_ROOT / ".env"` (no desde el
+# CWD) para que funcione también cuando pytest corre desde un
+# `git worktree` aislado (`.worktrees/<rama>/`), donde el CWD es el
+# worktree pero el `.env` vive únicamente en el repo principal.
 # ──────────────────────────────────────────────────────────────────
-load_dotenv()
+load_dotenv(_PROJECT_ROOT / ".env")
 
 
 # ──────────────────────────────────────────────────────────────────

@@ -65,6 +65,11 @@ pytest tests/test_state_machine.py -v   # un solo archivo
 - **Markers**: `unit` (sin red, mocks), `e2e` (API keys reales + servidor), `integration` (reservado, sin uso actual).
 - **E2E auto-skip**: si faltan env vars o el servidor no responde a `/global/health`, los tests E2E hacen `pytest.skip()`. Son seguros en CI.
 - **Tests de secrets**: `test_*_no_*_logged` verifican con `caplog` que las API keys no aparezcan en logs. Usan strings sentinel tipo `SECRET_*_DO_NOT_LEAK_777`. Preservar al tocar logging de clientes.
+- **Tests desde `git worktree` aislados**: cuando un subagente trabaja en `.worktrees/<rama>/`, el worktree solo contiene archivos trackeados — `.venv/`, `.env` y `models/` están gitignored y NO se copian al worktree. Patrones:
+  - **Venv**: NO recrear `.venv` dentro del worktree. Invocar pytest con ruta absoluta al venv del repo principal: `C:\Users\crist\repos\dev-cortex\.venv\Scripts\python.exe -m pytest tests/ -m unit -v` (correr desde el directorio del worktree con `workdir`).
+  - **`.env`**: `conftest.py` carga `_PROJECT_ROOT / ".env"` explícitamente, donde `_PROJECT_ROOT` se resuelve desde `__file__` (no desde CWD). Funciona automáticamente desde cualquier worktree — no hace falta symlink ni copiar `.env`.
+  - **`config/settings.json`**: la fixture `settings` y el `__init__` de `VoiceAssistant` lo resuelven vía `_PROJECT_ROOT / "config" / "settings.json"`. Funciona desde cualquier worktree.
+  - **`models/`** (Whisper/Kokoro/Piper): no se necesitan para unit tests (todo se mockea). Los E2E que requieren modelos reales se auto-skippean si no los encuentran. No hace falta symlink.
 
 ## Pipeline de streaming
 
