@@ -433,7 +433,11 @@ class TestTTSFailoverChain:
         """Variante de ``test_tts_all_fail_no_playback``: Azure NO configurado.
 
         Si ``_azure_tts is None``, el código retorna antes de invocar
-        Azure y queda en estado IDLE.
+        Azure y queda en estado IDLE. El código emite un único log
+        genérico de fallo total (``"Todos los TTS fallaron..."``); no
+        existe un log específico de "Azure no configurado" en esta
+        versión (se omite intencionalmente para simplificar el manejo
+        del failover).
         """
         # Arrange
         _wire_successful_agent(patched_assistant)
@@ -450,14 +454,19 @@ class TestTTSFailoverChain:
         # Assert
         patched_assistant._local_tts.synthesize.assert_called_once()
         patched_assistant._gemini_tts.synthesize.assert_called_once()
+        # Azure NO se invoca (es None)
+        assert patched_assistant._azure_tts is None
         # Sin playback por ninguna vía
         patched_assistant._audio.play_audio.assert_not_called()
         patched_assistant._audio.play_audio_stream.assert_not_called()
-        # Log de "Azure no configurado"
+        # Log genérico de fallo total (verifica que se diagnosticó el fallo)
         assert any(
-            "azure" in r.getMessage().lower() and "no configurado" in r.getMessage().lower()
+            "Todos los TTS fallaron" in r.getMessage()
             for r in caplog.records
-        ), f"Log de Azure no configurado no encontrado. Logs: {[r.getMessage() for r in caplog.records]}"
+        ), (
+            "Log 'Todos los TTS fallaron...' no encontrado. "
+            f"Logs: {[r.getMessage() for r in caplog.records]}"
+        )
         # Estado final IDLE
         assert patched_assistant._state == patched_assistant.STATE_IDLE
 
