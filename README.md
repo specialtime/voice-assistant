@@ -64,7 +64,6 @@ dev-cortex/
     ├── test_local_integration.py #  Tests de failover chain local→cloud
     ├── test_logging.py
     ├── test_opencode_client.py
-    ├── test_opencode_wrapper.py
     ├── test_overlay.py
     ├── test_piper_tts_client.py #  Tests Piper TTS local
     ├── test_kokoro_tts_client.py #  Tests Kokoro TTS local
